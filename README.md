@@ -1,45 +1,45 @@
 # SX3Downloader
 
-Eina de terminal escrita amb la biblioteca estàndard de Python. Detecta automàticament si una URL de 3Cat correspon a un episodi o a una sèrie, mostra tot el material descarregable i descarrega els vídeos.
+Aplicació gràfica multiplataforma escrita amb Zig, Sokol i Nuklear per consultar i descarregar el material públic disponible als episodis de 3Cat/SX3.
 
-## Requisits
+## Funcionalitat
 
-- Python 3.11 o superior.
-- No cal instal·lar cap paquet de Python.
-- [FFmpeg](https://ffmpeg.org/) és opcional. Quan està disponible permet escollir les versions DASH, les pistes d'àudio i els subtítols, i ho combina tot en un MP4. Sense FFmpeg només es mostren fitxers directes que ja contenen vídeo i àudio, com l'MP4 de 720p.
+- Accepta l'URL d'un episodi o d'una sèrie.
+- En una sèrie, mostra les temporades i els episodis; en seleccionar-ne un, carrega les seves pistes.
+- **Descàrrega individual:** mostra tots els vídeos, àudios i subtítols i baixa exactament els fitxers seleccionats. Aquest camí no detecta, invoca ni necessita FFmpeg.
+- **Muxing:** només es mostra quan FFmpeg està instal·lat. Permet seleccionar un vídeo DASH, diversos àudios, l'àudio per defecte i els subtítols, i genera un MP4.
+- Durant una descàrrega la interfície queda temporalment en mode de només lectura i mostra el progrés.
 
-## Ús
+La descàrrega individual d'una representació DASH uneix, mitjançant HTTP, el segment d'inicialització i els fragments de la mateixa pista. El resultat continua sent una pista independent; no s'hi barreja cap àudio, vídeo ni subtítol.
 
-```powershell
-python main.py URL
-```
+## Compilar
 
-Exemple amb un episodi:
-
-```powershell
-python main.py "https://www.3cat.cat/tv3/sx3/t1xc1-la-patrulla-fa-un-rescat-passat-per-aigua/video/6314970/"
-```
-
-Mostra l’ID i totes les dades retornades per l’API de 3Cat. Si detecta FFmpeg, el selector mostra els vídeos, els àudios i els subtítols disponibles. El vídeo de més qualitat queda seleccionat per defecte, i totes les pistes d'àudio i subtítols queden incloses per defecte. En els episodis comprovats hi ha 1080p, 720p i 576p dins del manifest DASH, a més de l’MP4 directe de 720p.
-
-Si no detecta FFmpeg, no mostra les representacions DASH ni les pistes separades: només ofereix formats directes complets com MP4, M4V, MOV, MKV o WebM.
-
-Exemple amb una sèrie:
+Cal Zig 0.16.0. Les versions fixades de Sokol i Nuklear ja són a `vendor/`; no cal `build.zig.zon`, Git ni cap gestor de dependències.
 
 ```powershell
-python main.py "https://www.3cat.cat/tv3/sx3/la-patrulla-peluda/"
+zig build -Doptimize=ReleaseSafe
 ```
 
-Mostra les temporades i, dins de cadascuna, l’ID, número, títol, durada, miniatura i URL de cada episodi. Després permet seleccionar una sola vegada el vídeo, els àudios i els subtítols; aquesta selecció s'aplica a tota la sèrie.
+L'executable queda a `zig-out/bin/sx3downloader.exe` a Windows. A macOS i Linux no porta l'extensió `.exe`.
 
-Els vídeos es desen dins de `videos/Temporada N/`. Si un fitxer ja existeix, el programa no el torna a descarregar. Una descàrrega incompleta utilitza temporalment l’extensió `.part` i s’elimina si es produeix un error.
+Per compilar a Linux cal tenir disponibles les biblioteques de desenvolupament d'OpenGL, X11, Xi i Xcursor. A Windows s'utilitza D3D11 i a macOS, Metal.
 
-Si la URL no és vàlida o no correspon a cap d’aquests tipus, el programa mostra un error i exemples d’ús.
+## Executar
+
+```powershell
+zig build run
+```
+
+També es pot executar directament el binari compilat. Els fitxers es desen a la carpeta `downloads/` del directori de treball.
+
+FFmpeg és completament opcional. Si no es troba al `PATH`, la secció de muxing no apareix, però tota la descàrrega individual continua disponible.
 
 ## Proves
 
 ```powershell
-python -m unittest discover -s tests -v
+zig build test
 ```
 
-El programa només consulta informació pública de 3Cat i no intenta saltar DRM, autenticació ni cap protecció de la plataforma.
+El client de terminal anterior en Python es conserva de moment a `main.py` i `sx3downloader/`.
+
+El programa només consulta material públic exposat per 3Cat i no intenta saltar DRM, autenticació ni cap protecció de la plataforma.

@@ -1,0 +1,319 @@
+const std = @import("std");
+const core = @import("core.zig");
+
+pub const user_agent = "SX3Downloader-Zig/0.1";
+
+pub const Progress = struct {
+    current: *std.atomic.Value(u64),
+    total: *std.atomic.Value(u64),
+
+    fn reset(self: Progress, total: u64) void {
+        self.current.store(0, .release);
+        self.total.store(@max(total, 1), .release);
+    }
+
+    fn advance(self: Progress) void {
+        _ = self.current.fetchAdd(1, .acq_rel);
+    }
+};
+
+pub fn getAlloc(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    errdefer body.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &body.writer,
+        .headers = .{ .user_agent = .{ .override = user_agent } },
+    });
+    if (result.status.class() != .success) return error.HttpStatus;
+    var list = body.toArrayList();
+    return try list.toOwnedSlice(allocator);
+}
+
+pub fn fetchEpisode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    episode_id: []const u8,
+    episode: *core.Episode,
+) !void {
+    var api_url_buffer: [1024]u8 = undefined;
+    const api_url = try std.fmt.bufPrint(
+        &api_url_buffer,
+        "https://api-media.3cat.cat/pvideo/media.jsp?media=video&versio=vast&idint={s}&profile=pc_3cat&format=dm",
+        .{episode_id},
+    );
+    const json = try getAlloc(allocator, io, api_url);
+    defer allocator.free(json);
+    try core.parseEpisodeJson(allocator, json, episode);
+    if (episode.id.len == 0) episode.id.set(episode_id);
+
+    if (episode.manifest_url.len > 0) {
+        const manifest = try getAlloc(allocator, io, episode.manifest_url.slice());
+        defer allocator.free(manifest);
+        try core.parseDashManifest(manifest, episode);
+    }
+}
+
+pub fn fetchSeries(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    series_url: []const u8,
+    series: *core.Series,
+) !void {
+    const index_html = try getAlloc(allocator, io, series_url);
+    defer allocator.free(index_html);
+    try core.parseSeriesIndex(index_html, series_url, series);
+
+    var season_index: usize = 0;
+    while (season_index < series.season_count) : (season_index += 1) {
+        const season_html = try getAlloc(allocator, io, series.seasons[season_index].url.slice());
+        defer allocator.free(season_html);
+        try core.parseSeasonPage(season_html, season_index, series);
+    }
+    if (series.episode_count == 0) return error.NoEpisodes;
+}
+
+pub fn ffmpegAvailable(allocator: std.mem.Allocator, io: std.Io) bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "ffmpeg", "-version" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn fetchToWriter(client: *std.http.Client, url: []const u8, writer: *std.Io.Writer) !void {
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = writer,
+        .headers = .{ .user_agent = .{ .override = user_agent } },
+    });
+    if (result.status.class() != .success) return error.HttpStatus;
+}
+
+fn sanitize(target: []u8, value: []const u8) []const u8 {
+    var length: usize = 0;
+    for (value) |byte| {
+        if (length >= target.len) break;
+        target[length] = switch (byte) {
+            '<', '>', ':', '"', '/', '\\', '|', '?', '*', 0...31 => '_',
+            else => byte,
+        };
+        length += 1;
+    }
+    while (length > 0 and (target[length - 1] == ' ' or target[length - 1] == '.')) length -= 1;
+    return if (length > 0) target[0..length] else "recurs";
+}
+
+fn urlExtension(url: []const u8, fallback: []const u8) []const u8 {
+    const path = (std.Uri.parse(url) catch return fallback).path.percent_encoded;
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return fallback;
+    const extension = path[dot..];
+    return if (extension.len <= 8) extension else fallback;
+}
+
+fn resourcePath(resource: *const core.Resource, episode: *const core.Episode, buffer: []u8) ![]const u8 {
+    var title_buffer: [280]u8 = undefined;
+    var label_buffer: [180]u8 = undefined;
+    const title = sanitize(&title_buffer, episode.title.slice());
+    const label = sanitize(&label_buffer, resource.label.slice());
+    const extension = switch (resource.kind) {
+        .direct_video => urlExtension(resource.url.slice(), ".mp4"),
+        .dash_video => ".mp4",
+        .dash_audio => ".m4a",
+        .subtitle => urlExtension(resource.url.slice(), ".vtt"),
+    };
+    return std.fmt.bufPrint(buffer, "downloads/{s} - {s}{s}", .{ title, label, extension });
+}
+
+fn segmentUrl(template: []const u8, number: u64, buffer: []u8) ![]const u8 {
+    const marker = "$Number$";
+    const marker_start = std.mem.indexOf(u8, template, marker) orelse return error.InvalidSegmentTemplate;
+    return std.fmt.bufPrint(
+        buffer,
+        "{s}{d}{s}",
+        .{ template[0..marker_start], number, template[marker_start + marker.len ..] },
+    );
+}
+
+fn downloadResource(
+    client: *std.http.Client,
+    io: std.Io,
+    resource: *const core.Resource,
+    episode: *const core.Episode,
+    progress: Progress,
+) !void {
+    var final_path_buffer: [1024]u8 = undefined;
+    const final_path = try resourcePath(resource, episode, &final_path_buffer);
+    var temporary_path_buffer: [1032]u8 = undefined;
+    const temporary_path = try std.fmt.bufPrint(&temporary_path_buffer, "{s}.part", .{final_path});
+    const cwd = std.Io.Dir.cwd();
+    errdefer cwd.deleteFile(io, temporary_path) catch {};
+
+    {
+        const file = try cwd.createFile(io, temporary_path, .{});
+        defer file.close(io);
+        var write_buffer: [64 * 1024]u8 = undefined;
+        var file_writer = file.writerStreaming(io, &write_buffer);
+        if (resource.isDash()) {
+            try fetchToWriter(client, resource.initialization_url.slice(), &file_writer.interface);
+            progress.advance();
+            var number = resource.segment_start;
+            const end = resource.segment_start + resource.segment_count;
+            while (number < end) : (number += 1) {
+                var segment_url_buffer: [2048]u8 = undefined;
+                const url = try segmentUrl(resource.segment_url_template.slice(), number, &segment_url_buffer);
+                try fetchToWriter(client, url, &file_writer.interface);
+                progress.advance();
+            }
+        } else {
+            try fetchToWriter(client, resource.url.slice(), &file_writer.interface);
+            progress.advance();
+        }
+        try file_writer.interface.flush();
+    }
+    try cwd.rename(temporary_path, cwd, final_path, io);
+}
+
+pub fn downloadSelectedResources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    episode: *const core.Episode,
+    progress: Progress,
+) !void {
+    var total: u64 = 0;
+    for (episode.resources[0..episode.resource_count]) |*resource| {
+        if (!resource.selected_individual) continue;
+        total += if (resource.isDash()) resource.segment_count + 1 else 1;
+    }
+    if (total == 0) return error.NothingSelected;
+    progress.reset(total);
+    try std.Io.Dir.cwd().createDirPath(io, "downloads");
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    for (episode.resources[0..episode.resource_count]) |*resource| {
+        if (resource.selected_individual) {
+            try downloadResource(&client, io, resource, episode, progress);
+        }
+    }
+}
+
+fn addArgument(arguments: *[256][]const u8, count: *usize, value: []const u8) !void {
+    if (count.* >= arguments.len) return error.TooManyArguments;
+    arguments[count.*] = value;
+    count.* += 1;
+}
+
+pub fn muxSelected(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    episode: *const core.Episode,
+    progress: Progress,
+) !void {
+    var selected_video: ?*const core.Resource = null;
+    var audio_count: usize = 0;
+    var subtitle_count: usize = 0;
+    for (episode.resources[0..episode.resource_count]) |*resource| {
+        if (resource.kind == .dash_video and resource.selected_mux) selected_video = resource;
+        if (resource.kind == .dash_audio and resource.selected_mux) audio_count += 1;
+        if (resource.kind == .subtitle and episode.include_subtitles_mux) subtitle_count += 1;
+    }
+    const video = selected_video orelse return error.NoVideoSelected;
+    progress.reset(1);
+    try std.Io.Dir.cwd().createDirPath(io, "downloads");
+
+    var title_buffer: [280]u8 = undefined;
+    const title = sanitize(&title_buffer, episode.title.slice());
+    var final_path_buffer: [1024]u8 = undefined;
+    const final_path = try std.fmt.bufPrint(&final_path_buffer, "downloads/{s}.mp4", .{title});
+    var temporary_path_buffer: [1032]u8 = undefined;
+    const temporary_path = try std.fmt.bufPrint(&temporary_path_buffer, "{s}.part", .{final_path});
+
+    var arguments: [256][]const u8 = undefined;
+    var argument_count: usize = 0;
+    try addArgument(&arguments, &argument_count, "ffmpeg");
+    try addArgument(&arguments, &argument_count, "-hide_banner");
+    try addArgument(&arguments, &argument_count, "-loglevel");
+    try addArgument(&arguments, &argument_count, "error");
+    try addArgument(&arguments, &argument_count, "-y");
+    try addArgument(&arguments, &argument_count, "-i");
+    try addArgument(&arguments, &argument_count, episode.manifest_url.slice());
+    for (episode.resources[0..episode.resource_count]) |*resource| {
+        if (resource.kind == .subtitle and episode.include_subtitles_mux) {
+            try addArgument(&arguments, &argument_count, "-i");
+            try addArgument(&arguments, &argument_count, resource.url.slice());
+        }
+    }
+
+    var dynamic_arguments: [core.max_resources * 3][48]u8 = undefined;
+    var dynamic_count: usize = 0;
+    try addArgument(&arguments, &argument_count, "-map");
+    const video_map = try std.fmt.bufPrint(&dynamic_arguments[dynamic_count], "0:v:{d}", .{video.stream_index});
+    dynamic_count += 1;
+    try addArgument(&arguments, &argument_count, video_map);
+
+    var selected_audio_index: usize = 0;
+    for (episode.resources[0..episode.resource_count]) |*resource| {
+        if (resource.kind != .dash_audio or !resource.selected_mux) continue;
+        try addArgument(&arguments, &argument_count, "-map");
+        const audio_map = try std.fmt.bufPrint(&dynamic_arguments[dynamic_count], "0:a:{d}", .{resource.stream_index});
+        dynamic_count += 1;
+        try addArgument(&arguments, &argument_count, audio_map);
+        const disposition_key = try std.fmt.bufPrint(&dynamic_arguments[dynamic_count], "-disposition:a:{d}", .{selected_audio_index});
+        dynamic_count += 1;
+        try addArgument(&arguments, &argument_count, disposition_key);
+        try addArgument(&arguments, &argument_count, if (resource.default_audio) "default" else "0");
+        selected_audio_index += 1;
+    }
+    var subtitle_input_index: usize = 1;
+    var selected_subtitle_index: usize = 0;
+    while (selected_subtitle_index < subtitle_count) : (selected_subtitle_index += 1) {
+        try addArgument(&arguments, &argument_count, "-map");
+        const subtitle_map = try std.fmt.bufPrint(&dynamic_arguments[dynamic_count], "{d}:s:0", .{subtitle_input_index});
+        dynamic_count += 1;
+        try addArgument(&arguments, &argument_count, subtitle_map);
+        subtitle_input_index += 1;
+    }
+    try addArgument(&arguments, &argument_count, "-c:v");
+    try addArgument(&arguments, &argument_count, "copy");
+    if (audio_count > 0) {
+        try addArgument(&arguments, &argument_count, "-c:a");
+        try addArgument(&arguments, &argument_count, "copy");
+    }
+    if (subtitle_count > 0) {
+        try addArgument(&arguments, &argument_count, "-c:s");
+        try addArgument(&arguments, &argument_count, "mov_text");
+    }
+    try addArgument(&arguments, &argument_count, "-movflags");
+    try addArgument(&arguments, &argument_count, "+faststart");
+    try addArgument(&arguments, &argument_count, "-f");
+    try addArgument(&arguments, &argument_count, "mp4");
+    try addArgument(&arguments, &argument_count, temporary_path);
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = arguments[0..argument_count],
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    const succeeded = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!succeeded) {
+        std.Io.Dir.cwd().deleteFile(io, temporary_path) catch {};
+        return error.FfmpegFailed;
+    }
+    try std.Io.Dir.cwd().rename(temporary_path, std.Io.Dir.cwd(), final_path, io);
+    progress.advance();
+}
