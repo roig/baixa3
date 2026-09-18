@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sx3downloader"
+version = "0.1.0"
+description = "Extreu temporades i episodis públics de 3Cat/SX3"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+sx3downloader = "sx3downloader.cli:main"
