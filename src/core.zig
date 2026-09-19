@@ -95,6 +95,7 @@ pub const EpisodeSummary = struct {
     url: FixedText(2048) = .{},
     season: u16 = 0,
     number: u16 = 0,
+    selected: bool = false,
 };
 
 pub const Season = struct {
@@ -118,6 +119,16 @@ pub const Series = struct {
 
 pub const PageKind = enum { none, episode, series };
 
+pub const SeriesUrlKind = enum {
+    sx3_legacy,
+    threecat,
+};
+
+pub const SeriesLocation = struct {
+    kind: SeriesUrlKind = .sx3_legacy,
+    root_url: FixedText(2048) = .{},
+};
+
 pub fn extractEpisodeId(url: []const u8) ?[]const u8 {
     const marker = "/video/";
     const start = std.mem.indexOf(u8, url, marker) orelse return null;
@@ -125,6 +136,43 @@ pub fn extractEpisodeId(url: []const u8) ?[]const u8 {
     var end: usize = 0;
     while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
     return if (end > 0) tail[0..end] else null;
+}
+
+pub fn classifySeriesUrl(input: []const u8, location: *SeriesLocation) !void {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "https://www.3cat.cat/") and
+        !std.mem.startsWith(u8, trimmed, "http://www.3cat.cat/"))
+    {
+        return error.InvalidSeriesUrl;
+    }
+
+    const suffix_start = std.mem.indexOfAny(u8, trimmed, "?#") orelse trimmed.len;
+    const clean = trimmed[0..suffix_start];
+    const kind: SeriesUrlKind = if (std.mem.indexOf(u8, clean, "/tv3/sx3/") != null)
+        .sx3_legacy
+    else if (std.mem.indexOf(u8, clean, "/3cat/") != null)
+        .threecat
+    else
+        return error.InvalidSeriesUrl;
+
+    location.* = .{ .kind = kind };
+    const section_marker = switch (kind) {
+        .sx3_legacy => "/videos/",
+        .threecat => "/capitols/temporada/",
+    };
+    if (std.mem.indexOf(u8, clean, section_marker)) |section_start| {
+        location.root_url.set(clean[0 .. section_start + 1]);
+    } else if (std.mem.endsWith(u8, clean, "/")) {
+        location.root_url.set(clean);
+    } else {
+        location.root_url.setFmt("{s}/", .{clean});
+    }
+}
+
+pub fn normalizeSeriesUrl(input: []const u8, target: *FixedText(2048)) !void {
+    var location: SeriesLocation = .{};
+    try classifySeriesUrl(input, &location);
+    target.set(location.root_url.slice());
 }
 
 fn jsonString(value: ?std.json.Value) ?[]const u8 {
@@ -203,13 +251,14 @@ fn resolvePageUrl(target: *FixedText(2048), base_url: []const u8, relative: []co
 }
 
 fn seasonNumberFromUrl(url: []const u8) ?u16 {
-    const marker = "/temporada-";
-    const start = std.mem.indexOf(u8, url, marker) orelse return null;
-    const tail = url[start + marker.len ..];
-    var end: usize = 0;
-    while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
-    if (end == 0) return null;
-    return std.fmt.parseUnsigned(u16, tail[0..end], 10) catch null;
+    for ([_][]const u8{ "/temporada-", "/temporada/" }) |marker| {
+        const start = std.mem.indexOf(u8, url, marker) orelse continue;
+        const tail = url[start + marker.len ..];
+        var end: usize = 0;
+        while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
+        if (end > 0) return std.fmt.parseUnsigned(u16, tail[0..end], 10) catch null;
+    }
+    return null;
 }
 
 fn findHtmlAttribute(tag: []const u8, name: []const u8) ?[]const u8 {
@@ -253,11 +302,38 @@ fn stripTags(target: []u8, html: []const u8) []const u8 {
     return target[0..output];
 }
 
+fn hasSeason(series: *const Series, number: u16) bool {
+    for (series.seasons[0..series.season_count]) |season| {
+        if (season.number == number) return true;
+    }
+    return false;
+}
+
+fn addLinkedSeason(series: *Series, number: u16, base_url: []const u8, href: []const u8) void {
+    if (hasSeason(series, number) or series.season_count >= series.seasons.len) return;
+    const season = &series.seasons[series.season_count];
+    season.* = .{ .number = number };
+    resolvePageUrl(&season.url, base_url, href);
+    series.season_count += 1;
+}
+
+fn addThreecatSeason(series: *Series, number: u16, root_url: []const u8) void {
+    if (hasSeason(series, number) or series.season_count >= series.seasons.len) return;
+    const season = &series.seasons[series.season_count];
+    season.* = .{ .number = number };
+    season.url.setFmt("{s}capitols/temporada/{d}/", .{ root_url, number });
+    series.season_count += 1;
+}
+
 pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series) !void {
     series.clear();
-    if (std.mem.indexOf(u8, html, "<title>")) |title_start| {
-        const value_start = title_start + "<title>".len;
-        if (std.mem.indexOfPos(u8, html, value_start, "</title>")) |title_end| {
+    var location: SeriesLocation = .{};
+    try classifySeriesUrl(base_url, &location);
+
+    if (std.mem.indexOf(u8, html, "<title")) |title_start| {
+        if (std.mem.indexOfPos(u8, html, title_start, ">")) |title_open_end| {
+            const value_start = title_open_end + 1;
+            const title_end = std.mem.indexOfPos(u8, html, value_start, "</title>") orelse value_start;
             var title_buffer: [256]u8 = undefined;
             series.title.set(stripTags(&title_buffer, html[value_start..title_end]));
         }
@@ -280,16 +356,7 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
             cursor = tag_end + 1;
             continue;
         };
-        var duplicate = false;
-        for (series.seasons[0..series.season_count]) |season| {
-            if (season.number == number) duplicate = true;
-        }
-        if (!duplicate and series.season_count < series.seasons.len) {
-            const season = &series.seasons[series.season_count];
-            season.* = .{ .number = number };
-            resolvePageUrl(&season.url, base_url, href);
-            series.season_count += 1;
-        }
+        addLinkedSeason(series, number, location.root_url.slice(), href);
         cursor = tag_end + 1;
     }
 
@@ -299,19 +366,26 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
         const tag = html[option_start .. option_end + 1];
         if (findHtmlAttribute(tag, "value")) |href| {
             if (seasonNumberFromUrl(href)) |number| {
-                var duplicate = false;
-                for (series.seasons[0..series.season_count]) |season| {
-                    if (season.number == number) duplicate = true;
-                }
-                if (!duplicate and series.season_count < series.seasons.len) {
-                    const season = &series.seasons[series.season_count];
-                    season.* = .{ .number = number };
-                    resolvePageUrl(&season.url, base_url, href);
-                    series.season_count += 1;
-                }
+                addLinkedSeason(series, number, location.root_url.slice(), href);
             }
         }
         option_cursor = option_end + 1;
+    }
+
+    if (location.kind == .threecat) {
+        var season_cursor: usize = 0;
+        const marker = "Temporada ";
+        while (std.mem.indexOfPos(u8, html, season_cursor, marker)) |season_start| {
+            const number_start = season_start + marker.len;
+            var number_end = number_start;
+            while (number_end < html.len and std.ascii.isDigit(html[number_end])) : (number_end += 1) {}
+            if (number_end > number_start) {
+                if (std.fmt.parseUnsigned(u16, html[number_start..number_end], 10)) |number| {
+                    addThreecatSeason(series, number, location.root_url.slice());
+                } else |_| {}
+            }
+            season_cursor = @max(number_end, number_start + 1);
+        }
     }
 
     if (series.season_count == 0) return error.NoSeasons;
@@ -368,9 +442,11 @@ pub fn parseSeasonPage(html: []const u8, season_index: usize, series: *Series) !
         }
 
         var title_buffer: [512]u8 = undefined;
+        const anchor_body = html[anchor_open_end + 1 .. anchor_close];
         const title = findHtmlAttribute(tag, "title") orelse
             findHtmlAttribute(tag, "aria-label") orelse
-            stripTags(&title_buffer, html[anchor_open_end + 1 .. anchor_close]);
+            findHtmlAttribute(anchor_body, "alt") orelse
+            stripTags(&title_buffer, anchor_body);
         if (episodeSeasonFromTitle(title)) |detected_season| {
             if (detected_season != season.number) {
                 cursor = anchor_close + 4;
@@ -564,6 +640,38 @@ test "extract episode id" {
     try std.testing.expect(extractEpisodeId("https://www.3cat.cat/serie/") == null);
 }
 
+test "normalize season url to series root" {
+    var normalized: FixedText(2048) = .{};
+    try normalizeSeriesUrl(
+        "https://www.3cat.cat/tv3/sx3/bola-de-drac-super/videos/temporada-1/",
+        &normalized,
+    );
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/tv3/sx3/bola-de-drac-super/",
+        normalized.slice(),
+    );
+
+    try normalizeSeriesUrl(
+        "https://www.3cat.cat/tv3/sx3/bola-de-drac-super?foo=bar",
+        &normalized,
+    );
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/tv3/sx3/bola-de-drac-super/",
+        normalized.slice(),
+    );
+
+    var location: SeriesLocation = .{};
+    try classifySeriesUrl(
+        "https://www.3cat.cat/3cat/la-patrulla-peluda/capitols/temporada/1/",
+        &location,
+    );
+    try std.testing.expectEqual(SeriesUrlKind.threecat, location.kind);
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/3cat/la-patrulla-peluda/",
+        location.root_url.slice(),
+    );
+}
+
 test "parse manifest resources" {
     const xml =
         \\<?xml version="1.0"?><MPD mediaPresentationDuration="P0Y0M0DT0H0M8.0S">
@@ -609,4 +717,30 @@ test "parse series seasons and episodes" {
         "https://www.3cat.cat/tv3/sx3/primer/video/122/",
         series.episodes[0].url.slice(),
     );
+}
+
+test "parse new 3cat series and nested episode title" {
+    const index_html =
+        \\<title data-next-head="">La Patrulla Peluda - 3Cat</title>
+        \\<button aria-label="Obrir desplegable temporades">Temporada 3</button>
+        \\<ul><li>Temporada 3</li><li>Temporada 2</li><li>Temporada 1</li></ul>
+        \\<a href="/3cat/la-patrulla-peluda/capitols/temporada/3/">Tots</a>
+    ;
+    var series: Series = .{};
+    try parseSeriesIndex(index_html, "https://www.3cat.cat/3cat/la-patrulla-peluda/", &series);
+    try std.testing.expectEqual(@as(usize, 3), series.season_count);
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/3cat/la-patrulla-peluda/capitols/temporada/1/",
+        series.seasons[0].url.slice(),
+    );
+
+    const season_html =
+        \\<a href="/3cat/t1xc1-primer/video/6314970/"><img alt="T1xC1 - Primer episodi"/></a>
+        \\<a href="/3cat/t1xc1-primer/video/6314970/"><h2>T1xC1 - Primer episodi</h2></a>
+        \\<a href="/3cat/t1xc2-segon/video/6314971/"><img alt="T1xC2 - Segon episodi"/></a>
+    ;
+    try parseSeasonPage(season_html, 0, &series);
+    try std.testing.expectEqual(@as(usize, 2), series.episode_count);
+    try std.testing.expectEqualStrings("T1xC1 - Primer episodi", series.episodes[0].title.slice());
+    try std.testing.expectEqualStrings("6314970", series.episodes[0].id.slice());
 }

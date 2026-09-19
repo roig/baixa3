@@ -2,6 +2,7 @@ videos/
 downloads/
 .zig-cache/
 zig-out/
+zig-out-fixed/
 __pycache__/
 *.py[cod]
 .venv/

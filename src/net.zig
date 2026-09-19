@@ -6,16 +6,79 @@ pub const user_agent = "SX3Downloader-Zig/0.1";
 pub const Progress = struct {
     current: *std.atomic.Value(u64),
     total: *std.atomic.Value(u64),
+    range_start: u64 = 0,
+    range_size: u64 = 0,
+    operation_current: ?*std.atomic.Value(u64) = null,
+    operation_total: ?*std.atomic.Value(u64) = null,
 
     fn reset(self: Progress, total: u64) void {
+        if (self.range_size > 0 and self.operation_current != null and self.operation_total != null) {
+            self.operation_current.?.store(0, .release);
+            self.operation_total.?.store(@max(total, 1), .release);
+            self.current.store(self.range_start, .release);
+            return;
+        }
         self.current.store(0, .release);
         self.total.store(@max(total, 1), .release);
     }
 
     fn advance(self: Progress) void {
+        if (self.range_size > 0 and self.operation_current != null and self.operation_total != null) {
+            const completed = self.operation_current.?.fetchAdd(1, .acq_rel) + 1;
+            const operation_total = @max(self.operation_total.?.load(.acquire), 1);
+            const scaled = @min(self.range_size, completed * self.range_size / operation_total);
+            self.current.store(self.range_start + scaled, .release);
+            return;
+        }
         _ = self.current.fetchAdd(1, .acq_rel);
     }
 };
+
+test "progress maps an operation into one batch range" {
+    var current = std.atomic.Value(u64).init(0);
+    var total = std.atomic.Value(u64).init(2000);
+    var operation_current = std.atomic.Value(u64).init(0);
+    var operation_total = std.atomic.Value(u64).init(1);
+    const progress: Progress = .{
+        .current = &current,
+        .total = &total,
+        .range_start = 1000,
+        .range_size = 1000,
+        .operation_current = &operation_current,
+        .operation_total = &operation_total,
+    };
+
+    progress.reset(4);
+    try std.testing.expectEqual(@as(u64, 1000), current.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2000), total.load(.acquire));
+    progress.advance();
+    try std.testing.expectEqual(@as(u64, 1250), current.load(.acquire));
+    progress.advance();
+    progress.advance();
+    progress.advance();
+    try std.testing.expectEqual(@as(u64, 2000), current.load(.acquire));
+}
+
+test "single-step mux progress completes one batch episode" {
+    var current = std.atomic.Value(u64).init(0);
+    var total = std.atomic.Value(u64).init(3000);
+    var operation_current = std.atomic.Value(u64).init(0);
+    var operation_total = std.atomic.Value(u64).init(1);
+    const progress: Progress = .{
+        .current = &current,
+        .total = &total,
+        .range_start = 1000,
+        .range_size = 1000,
+        .operation_current = &operation_current,
+        .operation_total = &operation_total,
+    };
+
+    progress.reset(1);
+    try std.testing.expectEqual(@as(u64, 1000), current.load(.acquire));
+    progress.advance();
+    try std.testing.expectEqual(@as(u64, 2000), current.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 3000), total.load(.acquire));
+}
 
 pub fn getAlloc(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
@@ -63,9 +126,11 @@ pub fn fetchSeries(
     series_url: []const u8,
     series: *core.Series,
 ) !void {
-    const index_html = try getAlloc(allocator, io, series_url);
+    var normalized_url: core.FixedText(2048) = .{};
+    try core.normalizeSeriesUrl(series_url, &normalized_url);
+    const index_html = try getAlloc(allocator, io, normalized_url.slice());
     defer allocator.free(index_html);
-    try core.parseSeriesIndex(index_html, series_url, series);
+    try core.parseSeriesIndex(index_html, normalized_url.slice(), series);
 
     var season_index: usize = 0;
     while (season_index < series.season_count) : (season_index += 1) {

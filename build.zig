@@ -9,13 +9,27 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .link_libcpp = true,
     });
     module.addIncludePath(b.path("src"));
     module.addIncludePath(b.path("vendor/sokol"));
-    module.addIncludePath(b.path("vendor/nuklear"));
+    module.addIncludePath(b.path("vendor/imgui"));
     module.addCSourceFile(.{
-        .file = b.path("src/sokol_impl.c"),
-        .flags = if (target.result.os.tag.isDarwin()) &.{"-ObjC"} else &.{},
+        .file = b.path("src/sokol_impl.cpp"),
+        .flags = if (target.result.os.tag.isDarwin())
+            &.{ "-std=c++17", "-ObjC++" }
+        else
+            &.{"-std=c++17"},
+    });
+    module.addCSourceFiles(.{
+        .root = b.path("vendor/imgui"),
+        .files = &.{
+            "imgui.cpp",
+            "imgui_draw.cpp",
+            "imgui_tables.cpp",
+            "imgui_widgets.cpp",
+        },
+        .flags = &.{"-std=c++17"},
     });
 
     switch (target.result.os.tag) {
@@ -48,6 +62,9 @@ pub fn build(b: *std.Build) void {
         .name = "sx3downloader",
         .root_module = module,
     });
+    if (target.result.os.tag == .windows) {
+        exe.subsystem = .windows;
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -64,6 +81,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(tests);
+    const net_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/net.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_net_tests = b.addRunArtifact(net_tests);
     const test_step = b.step("test", "Executa les proves Zig");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_net_tests.step);
 }
