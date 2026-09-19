@@ -3,6 +3,7 @@ const std = @import("std");
 pub const max_resources = 64;
 pub const max_seasons = 16;
 pub const max_episodes = 512;
+pub const max_catalog_items = 2048;
 
 pub fn FixedText(comptime capacity: usize) type {
     return struct {
@@ -103,6 +104,7 @@ pub const Season = struct {
     url: FixedText(2048) = .{},
     first_episode: usize = 0,
     episode_count: usize = 0,
+    is_virtual: bool = false,
 };
 
 pub const Series = struct {
@@ -113,6 +115,20 @@ pub const Series = struct {
     episode_count: usize = 0,
 
     pub fn clear(self: *Series) void {
+        self.* = .{};
+    }
+};
+
+pub const CatalogItem = struct {
+    title: FixedText(256) = .{},
+    url: FixedText(512) = .{},
+};
+
+pub const Catalog = struct {
+    items: [max_catalog_items]CatalogItem = [_]CatalogItem{.{}} ** max_catalog_items,
+    item_count: usize = 0,
+
+    pub fn clear(self: *Catalog) void {
         self.* = .{};
     }
 };
@@ -158,7 +174,7 @@ pub fn classifySeriesUrl(input: []const u8, location: *SeriesLocation) !void {
     location.* = .{ .kind = kind };
     const section_marker = switch (kind) {
         .sx3_legacy => "/videos/",
-        .threecat => "/capitols/temporada/",
+        .threecat => "/capitols/",
     };
     if (std.mem.indexOf(u8, clean, section_marker)) |section_start| {
         location.root_url.set(clean[0 .. section_start + 1]);
@@ -181,6 +197,70 @@ fn jsonString(value: ?std.json.Value) ?[]const u8 {
         .string => |string| string,
         else => null,
     };
+}
+
+fn catalogContains(catalog: *const Catalog, slug: []const u8) bool {
+    var expected_url: FixedText(512) = .{};
+    expected_url.setFmt("https://www.3cat.cat/3cat/{s}/", .{slug});
+    for (catalog.items[0..catalog.item_count]) |item| {
+        if (std.mem.eql(u8, item.url.slice(), expected_url.slice())) return true;
+    }
+    return false;
+}
+
+fn collectCatalogItems(value: std.json.Value, catalog: *Catalog) !void {
+    switch (value) {
+        .object => |object| {
+            const content_type = jsonString(object.get("tipologia"));
+            const slug = jsonString(object.get("nombonic"));
+            const title = jsonString(object.get("titol"));
+            if (content_type != null and slug != null and title != null and
+                std.mem.eql(u8, content_type.?, "PTVC_PROGRAMA") and
+                slug.?.len > 0 and title.?.len > 0 and
+                !catalogContains(catalog, slug.?))
+            {
+                if (catalog.item_count >= catalog.items.len) return error.TooManyCatalogItems;
+                const item = &catalog.items[catalog.item_count];
+                item.* = .{};
+                item.title.set(title.?);
+                item.url.setFmt("https://www.3cat.cat/3cat/{s}/", .{slug.?});
+                catalog.item_count += 1;
+            }
+
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                try collectCatalogItems(entry.value_ptr.*, catalog);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectCatalogItems(item, catalog);
+        },
+        else => {},
+    }
+}
+
+pub fn parseCatalogPage(allocator: std.mem.Allocator, html: []const u8, catalog: *Catalog) !void {
+    catalog.clear();
+    const id_position = std.mem.indexOf(u8, html, "id=\"__NEXT_DATA__\"") orelse
+        return error.CatalogDataNotFound;
+    const script_start = std.mem.lastIndexOf(u8, html[0..id_position], "<script") orelse
+        return error.CatalogDataNotFound;
+    const json_start_marker = std.mem.indexOfPos(u8, html, script_start, ">") orelse
+        return error.CatalogDataNotFound;
+    const json_start = json_start_marker + 1;
+    const json_end = std.mem.indexOfPos(u8, html, json_start, "</script>") orelse
+        return error.CatalogDataNotFound;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, html[json_start..json_end], .{});
+    defer parsed.deinit();
+    try collectCatalogItems(parsed.value, catalog);
+    if (catalog.item_count == 0) return error.EmptyCatalog;
+
+    std.mem.sort(CatalogItem, catalog.items[0..catalog.item_count], {}, struct {
+        fn lessThan(_: void, left: CatalogItem, right: CatalogItem) bool {
+            return std.mem.lessThan(u8, left.title.slice(), right.title.slice());
+        }
+    }.lessThan);
 }
 
 fn attribute(tag: []const u8, name: []const u8) ?[]const u8 {
@@ -329,6 +409,7 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
     series.clear();
     var location: SeriesLocation = .{};
     try classifySeriesUrl(base_url, &location);
+    var unseasoned_chapters_url: FixedText(2048) = .{};
 
     if (std.mem.indexOf(u8, html, "<title")) |title_start| {
         if (std.mem.indexOfPos(u8, html, title_start, ">")) |title_open_end| {
@@ -352,6 +433,12 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
             cursor = tag_end + 1;
             continue;
         };
+        if (location.kind == .threecat and
+            std.mem.indexOf(u8, href, "/capitols/") != null and
+            std.mem.indexOf(u8, href, "/capitols/temporada/") == null)
+        {
+            resolvePageUrl(&unseasoned_chapters_url, location.root_url.slice(), href);
+        }
         const number = seasonNumberFromUrl(href) orelse {
             cursor = tag_end + 1;
             continue;
@@ -386,6 +473,12 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
             }
             season_cursor = @max(number_end, number_start + 1);
         }
+    }
+
+    if (series.season_count == 0 and unseasoned_chapters_url.len > 0) {
+        series.seasons[0] = .{ .number = 1, .is_virtual = true };
+        series.seasons[0].url.set(unseasoned_chapters_url.slice());
+        series.season_count = 1;
     }
 
     if (series.season_count == 0) return error.NoSeasons;
@@ -448,7 +541,7 @@ pub fn parseSeasonPage(html: []const u8, season_index: usize, series: *Series) !
             findHtmlAttribute(anchor_body, "alt") orelse
             stripTags(&title_buffer, anchor_body);
         if (episodeSeasonFromTitle(title)) |detected_season| {
-            if (detected_season != season.number) {
+            if (!season.is_virtual and detected_season != season.number) {
                 cursor = anchor_close + 4;
                 continue;
             }
@@ -670,6 +763,15 @@ test "normalize season url to series root" {
         "https://www.3cat.cat/3cat/la-patrulla-peluda/",
         location.root_url.slice(),
     );
+
+    try normalizeSeriesUrl(
+        "https://www.3cat.cat/3cat/lo-cartanya-especial-20-anys/capitols/",
+        &normalized,
+    );
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/3cat/lo-cartanya-especial-20-anys/",
+        normalized.slice(),
+    );
 }
 
 test "parse manifest resources" {
@@ -743,4 +845,50 @@ test "parse new 3cat series and nested episode title" {
     try std.testing.expectEqual(@as(usize, 2), series.episode_count);
     try std.testing.expectEqualStrings("T1xC1 - Primer episodi", series.episodes[0].title.slice());
     try std.testing.expectEqualStrings("6314970", series.episodes[0].id.slice());
+}
+
+test "parse new 3cat program without seasons" {
+    const index_html =
+        \\<title>&quot;Lo Cartanyà&quot;, especial 20 anys - 3Cat</title>
+        \\<a href="/3cat/lo-cartanya-especial-20-anys/capitols/">Capítols</a>
+    ;
+    var series: Series = .{};
+    try parseSeriesIndex(
+        index_html,
+        "https://www.3cat.cat/3cat/lo-cartanya-especial-20-anys/",
+        &series,
+    );
+    try std.testing.expectEqual(@as(usize, 1), series.season_count);
+    try std.testing.expect(series.seasons[0].is_virtual);
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/3cat/lo-cartanya-especial-20-anys/capitols/",
+        series.seasons[0].url.slice(),
+    );
+
+    const chapters_html =
+        \\<a href="/3cat/t1xc1-primer/video/6385177/"><img alt="T1xC1 - Primer"/></a>
+        \\<a href="/3cat/t2xc1-segon/video/6385178/"><img alt="T2xC1 - Segon"/></a>
+    ;
+    try parseSeasonPage(chapters_html, 0, &series);
+    try std.testing.expectEqual(@as(usize, 2), series.episode_count);
+}
+
+test "parse catalog embedded in next data" {
+    const html =
+        \\<html><body><script id="__NEXT_DATA__" type="application/json">
+        \\{"props":{"items":[
+        \\{"tipologia":"PTVC_PROGRAMA","nombonic":"zeta","titol":"Zeta"},
+        \\{"tipologia":"PTVC_VIDEO","nombonic":"ignorat","titol":"Ignorat"},
+        \\{"tipologia":"PTVC_PROGRAMA","nombonic":"alfa","titol":"Alfa"},
+        \\{"tipologia":"PTVC_PROGRAMA","nombonic":"alfa","titol":"Alfa duplicat"}
+        \\]}}</script></body></html>
+    ;
+    var catalog: Catalog = .{};
+    try parseCatalogPage(std.testing.allocator, html, &catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.item_count);
+    try std.testing.expectEqualStrings("Alfa", catalog.items[0].title.slice());
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/3cat/alfa/",
+        catalog.items[0].url.slice(),
+    );
 }

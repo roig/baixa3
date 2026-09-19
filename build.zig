@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const exe = b.addExecutable(.{
-        .name = "sx3downloader",
+        .name = "baixa3",
         .root_module = module,
     });
     if (target.result.os.tag == .windows) {
@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Executa SX3Downloader");
+    const run_step = b.step("run", "Executa Baixa3");
     run_step.dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{

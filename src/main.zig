@@ -6,7 +6,11 @@ const c = @cImport({
     @cInclude("ui_bridge.h");
 });
 
+const app_version = "0.2.0";
+const app_display_name = "Baixa3 · v" ++ app_version;
+
 const JobKind = enum {
+    catalog,
     search,
     individual_download,
     mux,
@@ -30,6 +34,9 @@ var busy = std.atomic.Value(bool).init(false);
 var progress_current = std.atomic.Value(u64).init(0);
 var progress_total = std.atomic.Value(u64).init(1);
 var page_kind: core.PageKind = .none;
+var catalog: core.Catalog = .{};
+var catalog_ready = std.atomic.Value(bool).init(false);
+var catalog_selected_index: ?usize = null;
 var episode: core.Episode = .{};
 var series: core.Series = .{};
 var series_profile: core.Episode = .{};
@@ -61,6 +68,10 @@ fn startJob(kind: JobKind, url: []const u8) void {
     job.* = .{ .kind = kind };
     job.url.set(url);
     switch (kind) {
+        .catalog => {
+            catalog_ready.store(false, .release);
+            setStatus("Carregant tots els títols de 3Cat...");
+        },
         .search => {
             page_kind = .none;
             setStatus("Cercant contingut...");
@@ -97,6 +108,20 @@ fn selectedEpisodeCount(first: usize, end: usize) usize {
 
 fn setEpisodeSelection(first: usize, end: usize, selected: bool) void {
     for (series.episodes[first..end]) |*item| item.selected = selected;
+}
+
+fn batchOutputDirectory(item: *const core.EpisodeSummary, buffer: []u8) ![]const u8 {
+    for (series.seasons[0..series.season_count]) |season| {
+        if (season.number == item.season) {
+            return net.seriesOutputDirectory(
+                series.title.slice(),
+                season.number,
+                season.is_virtual,
+                buffer,
+            );
+        }
+    }
+    return error.SeasonNotFound;
 }
 
 fn unsignedDifference(left: u64, right: u64) u64 {
@@ -257,12 +282,19 @@ fn runSeriesIndividualDownload() void {
             continue;
         };
         applyIndividualBatchSettings(&current_episode);
+        var output_directory_buffer: [1024]u8 = undefined;
+        const output_directory = batchOutputDirectory(item, &output_directory_buffer) catch {
+            failed += 1;
+            finishBatchEpisode(position);
+            continue;
+        };
         var operation_current = std.atomic.Value(u64).init(0);
         var operation_total = std.atomic.Value(u64).init(1);
         net.downloadSelectedResources(
             allocator,
             app_io,
             &current_episode,
+            output_directory,
             .{
                 .current = &progress_current,
                 .total = &progress_total,
@@ -312,12 +344,19 @@ fn runSeriesMux() void {
             continue;
         };
         applyMuxProfile(&series_profile, &current_episode);
+        var output_directory_buffer: [1024]u8 = undefined;
+        const output_directory = batchOutputDirectory(item, &output_directory_buffer) catch {
+            failed += 1;
+            finishBatchEpisode(position);
+            continue;
+        };
         var operation_current = std.atomic.Value(u64).init(0);
         var operation_total = std.atomic.Value(u64).init(1);
         net.muxSelected(
             allocator,
             app_io,
             &current_episode,
+            output_directory,
             .{
                 .current = &progress_current,
                 .total = &progress_total,
@@ -341,6 +380,20 @@ fn worker(job: *Job) void {
     defer allocator.destroy(job);
     defer busy.store(false, .release);
     switch (job.kind) {
+        .catalog => {
+            net.fetchCatalog(allocator, app_io, &catalog) catch |err| {
+                setErrorStatus(err);
+                return;
+            };
+            catalog_ready.store(true, .release);
+            var message_buffer: [192]u8 = undefined;
+            const message = std.fmt.bufPrint(
+                &message_buffer,
+                "Base de dades carregada: {d} títols. FFmpeg {s}.",
+                .{ catalog.item_count, if (ffmpeg_detected) "detectat" else "no detectat" },
+            ) catch "Base de dades carregada.";
+            setStatus(message);
+        },
         .search => {
             if (core.extractEpisodeId(job.url.slice())) |id| {
                 net.fetchEpisode(allocator, app_io, id, &episode) catch |err| {
@@ -378,6 +431,7 @@ fn worker(job: *Job) void {
                 allocator,
                 app_io,
                 &episode,
+                "downloads",
                 .{ .current = &progress_current, .total = &progress_total },
             ) catch |err| {
                 setErrorStatus(err);
@@ -394,6 +448,7 @@ fn worker(job: *Job) void {
                 allocator,
                 app_io,
                 &episode,
+                "downloads",
                 .{ .current = &progress_current, .total = &progress_total },
             ) catch |err| {
                 setErrorStatus(err);
@@ -409,10 +464,7 @@ fn worker(job: *Job) void {
 fn init() callconv(.c) void {
     c.sx3_ui_setup();
     ffmpeg_detected = net.ffmpegAvailable(allocator, app_io);
-    setStatus(if (ffmpeg_detected)
-        "Introdueix una URL de 3Cat. FFmpeg detectat."
-    else
-        "Introdueix una URL de 3Cat. FFmpeg no detectat.");
+    startJob(.catalog, "");
 }
 
 fn resourceDescription(resource: *const core.Resource, buffer: []u8) [*:0]const u8 {
@@ -508,14 +560,14 @@ fn drawEpisode() void {
     c.sx3_ui_heading(episode.title.c());
     if (c.sx3_ui_tab_bar_begin("download_modes")) {
         if (c.sx3_ui_tab_begin("Descàrrega individual")) {
-            if (c.sx3_ui_panel_begin("episode_individual_options", 620.0)) {
+            if (c.sx3_ui_panel_begin("episode_individual_options", 540.0)) {
                 drawIndividual();
             }
             c.sx3_ui_panel_end();
             c.sx3_ui_tab_end();
         }
         if (ffmpeg_detected and c.sx3_ui_tab_begin("Muxing")) {
-            if (c.sx3_ui_panel_begin("episode_mux_options", 620.0)) {
+            if (c.sx3_ui_panel_begin("episode_mux_options", 540.0)) {
                 drawMuxing(&episode, "Descarrega i fes muxing", .mux);
             }
             c.sx3_ui_panel_end();
@@ -529,7 +581,7 @@ fn drawSeries() void {
     c.sx3_ui_heading(if (series.title.len > 0) series.title.c() else "Sèrie");
     c.sx3_ui_label("Selecciona els episodis i aplica les opcions de descàrrega a tot el lot.");
 
-    if (c.sx3_ui_panel_begin("episode_selection", 340.0)) {
+    if (c.sx3_ui_panel_begin("episode_selection", 300.0)) {
         const total_selected = selectedSeriesEpisodeCount();
         const all_selected = series.episode_count > 0 and total_selected == series.episode_count;
         var root_buffer: [128]u8 = undefined;
@@ -556,11 +608,18 @@ fn drawSeries() void {
                 const season_selected = selectedEpisodeCount(season.first_episode, end);
                 const season_all_selected = season.episode_count > 0 and season_selected == season.episode_count;
                 var season_buffer: [128]u8 = undefined;
-                const season_label = std.fmt.bufPrintZ(
-                    &season_buffer,
-                    "Temporada {d} · {d}/{d} episodis###temporada",
-                    .{ season.number, season_selected, season.episode_count },
-                ) catch "Temporada";
+                const season_label = if (season.is_virtual)
+                    std.fmt.bufPrintZ(
+                        &season_buffer,
+                        "Capítols · {d}/{d} episodis###temporada",
+                        .{ season_selected, season.episode_count },
+                    ) catch "Capítols"
+                else
+                    std.fmt.bufPrintZ(
+                        &season_buffer,
+                        "Temporada {d} · {d}/{d} episodis###temporada",
+                        .{ season.number, season_selected, season.episode_count },
+                    ) catch "Temporada";
 
                 c.sx3_ui_push_id(@intCast(season_index));
                 const new_selection = c.sx3_ui_checkbox_mixed(
@@ -597,7 +656,7 @@ fn drawSeries() void {
     c.sx3_ui_spacing();
     if (c.sx3_ui_tab_bar_begin("series_download_modes")) {
         if (c.sx3_ui_tab_begin("Descàrrega individual")) {
-            if (c.sx3_ui_panel_begin("series_individual_options", 260.0)) {
+            if (c.sx3_ui_panel_begin("series_individual_options", 220.0)) {
                 batch_download_complete_video = c.sx3_ui_checkbox(
                     "Descarrega el vídeo complet MP4/MKV de cada episodi",
                     batch_download_complete_video,
@@ -616,7 +675,7 @@ fn drawSeries() void {
             c.sx3_ui_tab_end();
         }
         if (ffmpeg_detected and c.sx3_ui_tab_begin("Muxing")) {
-            if (c.sx3_ui_panel_begin("series_mux_options", 260.0)) {
+            if (c.sx3_ui_panel_begin("series_mux_options", 220.0)) {
                 if (series_profile.resource_count > 0) {
                     c.sx3_ui_label("Aquest perfil s'intentarà aplicar a tots els episodis seleccionats.");
                     drawMuxing(&series_profile, "Descarrega i fes muxing dels episodis seleccionats", .series_mux);
@@ -635,11 +694,52 @@ fn updateUrlLength() void {
     url_length = std.mem.indexOfScalar(u8, &url_buffer, 0) orelse url_buffer.len - 1;
 }
 
-fn frame() callconv(.c) void {
-    const is_busy = busy.load(.acquire);
-    c.sx3_ui_frame_begin();
-    if (c.sx3_ui_window_begin()) {
-        c.sx3_ui_disable_begin(is_busy);
+fn drawSearchTabs(is_busy: bool) void {
+    if (!c.sx3_ui_tab_bar_begin("search_modes")) return;
+
+    if (c.sx3_ui_tab_begin("Base de dades")) {
+        const is_ready = catalog_ready.load(.acquire);
+        if (is_ready) {
+            var count_buffer: [96]u8 = undefined;
+            const count_label = std.fmt.bufPrintZ(
+                &count_buffer,
+                "Catàleg de 3Cat · {d} títols",
+                .{catalog.item_count},
+            ) catch "Catàleg de 3Cat";
+            c.sx3_ui_label(count_label.ptr);
+
+            const preview: [*:0]const u8 = if (catalog_selected_index) |index|
+                catalog.items[index].title.c()
+            else
+                "Selecciona un títol...";
+            c.sx3_ui_set_next_item_width(-112.0);
+            var requested_index: ?usize = null;
+            if (c.sx3_ui_combo_begin("##catalog", preview)) {
+                for (catalog.items[0..catalog.item_count], 0..) |*item, index| {
+                    c.sx3_ui_push_id(@intCast(index));
+                    const selected = catalog_selected_index != null and catalog_selected_index.? == index;
+                    if (c.sx3_ui_selectable(item.title.c(), selected)) requested_index = index;
+                    c.sx3_ui_pop_id();
+                }
+                c.sx3_ui_combo_end();
+            }
+            c.sx3_ui_same_line();
+            if (c.sx3_ui_button("Actualitza")) startJob(.catalog, "");
+
+            if (requested_index) |index| {
+                catalog_selected_index = index;
+                startJob(.search, catalog.items[index].url.slice());
+            }
+        } else if (is_busy) {
+            c.sx3_ui_label("S'està carregant el catàleg complet...");
+        } else {
+            c.sx3_ui_label("No s'ha pogut carregar el catàleg.");
+            if (c.sx3_ui_button("Torna-ho a provar")) startJob(.catalog, "");
+        }
+        c.sx3_ui_tab_end();
+    }
+
+    if (c.sx3_ui_tab_begin("Descàrrega directa")) {
         c.sx3_ui_set_next_item_width(-112.0);
         const submitted = c.sx3_ui_input_text(&url_buffer, url_buffer.len, is_busy);
         updateUrlLength();
@@ -648,6 +748,19 @@ fn frame() callconv(.c) void {
         if ((submitted or search_clicked) and !is_busy) {
             startJob(.search, url_buffer[0..url_length]);
         }
+        c.sx3_ui_tab_end();
+    }
+
+    c.sx3_ui_tab_bar_end();
+}
+
+fn frame() callconv(.c) void {
+    const is_busy = busy.load(.acquire);
+    c.sx3_ui_frame_begin();
+    if (c.sx3_ui_window_begin()) {
+        c.sx3_ui_heading(app_display_name);
+        c.sx3_ui_disable_begin(is_busy);
+        drawSearchTabs(is_busy);
         c.sx3_ui_disable_end(is_busy);
 
         c.sx3_ui_label(@ptrCast(&status_buffer));
@@ -695,7 +808,7 @@ pub fn main(init_data: std.process.Init) void {
     desc.height = 750;
     desc.high_dpi = true;
     desc.enable_clipboard = true;
-    desc.window_title = "SX3Downloader";
+    desc.window_title = app_display_name;
     desc.logger.func = c.slog_func;
     c.sapp_run(&desc);
 }

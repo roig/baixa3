@@ -108,7 +108,7 @@ extern "C" bool sx3_ui_window_begin(void) {
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoBringToFrontOnFocus;
-    return ImGui::Begin("SX3Downloader##main", nullptr, flags);
+    return ImGui::Begin("Baixa3##main", nullptr, flags);
 }
 
 extern "C" void sx3_ui_window_end(void) {
@@ -243,6 +243,25 @@ extern "C" bool sx3_ui_tab_begin(const char* label) {
 
 extern "C" void sx3_ui_tab_end(void) {
     ImGui::EndTabItem();
+}
+
+extern "C" bool sx3_ui_combo_begin(const char* label, const char* preview) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float max_height =
+        ImGui::GetTextLineHeightWithSpacing() * 24.0f + style.WindowPadding.y * 2.0f;
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(0.0f, 0.0f),
+        ImVec2(FLT_MAX, max_height)
+    );
+    return ImGui::BeginCombo(label, preview);
+}
+
+extern "C" void sx3_ui_combo_end(void) {
+    ImGui::EndCombo();
+}
+
+extern "C" bool sx3_ui_selectable(const char* label, bool selected) {
+    return ImGui::Selectable(label, selected);
 }
 
 extern "C" void sx3_ui_push_id(int id) {

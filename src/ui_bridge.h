@@ -44,6 +44,9 @@ bool sx3_ui_tab_bar_begin(const char* id);
 void sx3_ui_tab_bar_end(void);
 bool sx3_ui_tab_begin(const char* label);
 void sx3_ui_tab_end(void);
+bool sx3_ui_combo_begin(const char* label, const char* preview);
+void sx3_ui_combo_end(void);
+bool sx3_ui_selectable(const char* label, bool selected);
 void sx3_ui_push_id(int id);
 void sx3_ui_pop_id(void);
 

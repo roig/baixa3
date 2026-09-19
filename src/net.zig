@@ -1,7 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 
-pub const user_agent = "SX3Downloader-Zig/0.1";
+pub const user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0";
 
 pub const Progress = struct {
     current: *std.atomic.Value(u64),
@@ -141,6 +141,16 @@ pub fn fetchSeries(
     if (series.episode_count == 0) return error.NoEpisodes;
 }
 
+pub fn fetchCatalog(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    catalog: *core.Catalog,
+) !void {
+    const html = try getAlloc(allocator, io, "https://www.3cat.cat/3cat/tot-cataleg/tot/");
+    defer allocator.free(html);
+    try core.parseCatalogPage(allocator, html, catalog);
+}
+
 pub fn ffmpegAvailable(allocator: std.mem.Allocator, io: std.Io) bool {
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "ffmpeg", "-version" },
@@ -178,6 +188,29 @@ fn sanitize(target: []u8, value: []const u8) []const u8 {
     return if (length > 0) target[0..length] else "recurs";
 }
 
+pub fn seriesOutputDirectory(
+    series_title: []const u8,
+    season_number: u16,
+    is_virtual_season: bool,
+    buffer: []u8,
+) ![]const u8 {
+    var title_buffer: [280]u8 = undefined;
+    const title = sanitize(&title_buffer, series_title);
+    return if (is_virtual_season)
+        std.fmt.bufPrint(buffer, "downloads/{s}/Capítols", .{title})
+    else
+        std.fmt.bufPrint(buffer, "downloads/{s}/Temporada {d}", .{ title, season_number });
+}
+
+test "series output directories separate seasons and unseasoned programs" {
+    var buffer: [1024]u8 = undefined;
+    const season = try seriesOutputDirectory("Sèrie: prova", 2, false, &buffer);
+    try std.testing.expectEqualStrings("downloads/Sèrie_ prova/Temporada 2", season);
+
+    const chapters = try seriesOutputDirectory("Programa", 1, true, &buffer);
+    try std.testing.expectEqualStrings("downloads/Programa/Capítols", chapters);
+}
+
 fn urlExtension(url: []const u8, fallback: []const u8) []const u8 {
     const path = (std.Uri.parse(url) catch return fallback).path.percent_encoded;
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return fallback;
@@ -185,7 +218,12 @@ fn urlExtension(url: []const u8, fallback: []const u8) []const u8 {
     return if (extension.len <= 8) extension else fallback;
 }
 
-fn resourcePath(resource: *const core.Resource, episode: *const core.Episode, buffer: []u8) ![]const u8 {
+fn resourcePath(
+    resource: *const core.Resource,
+    episode: *const core.Episode,
+    output_directory: []const u8,
+    buffer: []u8,
+) ![]const u8 {
     var title_buffer: [280]u8 = undefined;
     var label_buffer: [180]u8 = undefined;
     const title = sanitize(&title_buffer, episode.title.slice());
@@ -196,7 +234,7 @@ fn resourcePath(resource: *const core.Resource, episode: *const core.Episode, bu
         .dash_audio => ".m4a",
         .subtitle => urlExtension(resource.url.slice(), ".vtt"),
     };
-    return std.fmt.bufPrint(buffer, "downloads/{s} - {s}{s}", .{ title, label, extension });
+    return std.fmt.bufPrint(buffer, "{s}/{s} - {s}{s}", .{ output_directory, title, label, extension });
 }
 
 fn segmentUrl(template: []const u8, number: u64, buffer: []u8) ![]const u8 {
@@ -214,11 +252,12 @@ fn downloadResource(
     io: std.Io,
     resource: *const core.Resource,
     episode: *const core.Episode,
+    output_directory: []const u8,
     progress: Progress,
 ) !void {
-    var final_path_buffer: [1024]u8 = undefined;
-    const final_path = try resourcePath(resource, episode, &final_path_buffer);
-    var temporary_path_buffer: [1032]u8 = undefined;
+    var final_path_buffer: [2048]u8 = undefined;
+    const final_path = try resourcePath(resource, episode, output_directory, &final_path_buffer);
+    var temporary_path_buffer: [2056]u8 = undefined;
     const temporary_path = try std.fmt.bufPrint(&temporary_path_buffer, "{s}.part", .{final_path});
     const cwd = std.Io.Dir.cwd();
     errdefer cwd.deleteFile(io, temporary_path) catch {};
@@ -252,6 +291,7 @@ pub fn downloadSelectedResources(
     allocator: std.mem.Allocator,
     io: std.Io,
     episode: *const core.Episode,
+    output_directory: []const u8,
     progress: Progress,
 ) !void {
     var total: u64 = 0;
@@ -261,13 +301,13 @@ pub fn downloadSelectedResources(
     }
     if (total == 0) return error.NothingSelected;
     progress.reset(total);
-    try std.Io.Dir.cwd().createDirPath(io, "downloads");
+    try std.Io.Dir.cwd().createDirPath(io, output_directory);
 
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
     for (episode.resources[0..episode.resource_count]) |*resource| {
         if (resource.selected_individual) {
-            try downloadResource(&client, io, resource, episode, progress);
+            try downloadResource(&client, io, resource, episode, output_directory, progress);
         }
     }
 }
@@ -282,6 +322,7 @@ pub fn muxSelected(
     allocator: std.mem.Allocator,
     io: std.Io,
     episode: *const core.Episode,
+    output_directory: []const u8,
     progress: Progress,
 ) !void {
     var selected_video: ?*const core.Resource = null;
@@ -294,13 +335,13 @@ pub fn muxSelected(
     }
     const video = selected_video orelse return error.NoVideoSelected;
     progress.reset(1);
-    try std.Io.Dir.cwd().createDirPath(io, "downloads");
+    try std.Io.Dir.cwd().createDirPath(io, output_directory);
 
     var title_buffer: [280]u8 = undefined;
     const title = sanitize(&title_buffer, episode.title.slice());
-    var final_path_buffer: [1024]u8 = undefined;
-    const final_path = try std.fmt.bufPrint(&final_path_buffer, "downloads/{s}.mp4", .{title});
-    var temporary_path_buffer: [1032]u8 = undefined;
+    var final_path_buffer: [2048]u8 = undefined;
+    const final_path = try std.fmt.bufPrint(&final_path_buffer, "{s}/{s}.mp4", .{ output_directory, title });
+    var temporary_path_buffer: [2056]u8 = undefined;
     const temporary_path = try std.fmt.bufPrint(&temporary_path_buffer, "{s}.part", .{final_path});
 
     var arguments: [256][]const u8 = undefined;
