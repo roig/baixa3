@@ -382,6 +382,63 @@ fn stripTags(target: []u8, html: []const u8) []const u8 {
     return target[0..output];
 }
 
+fn htmlEntityCodepoint(entity: []const u8) ?u21 {
+    if (std.mem.eql(u8, entity, "amp")) return '&';
+    if (std.mem.eql(u8, entity, "quot")) return '"';
+    if (std.mem.eql(u8, entity, "apos")) return '\'';
+    if (std.mem.eql(u8, entity, "lt")) return '<';
+    if (std.mem.eql(u8, entity, "gt")) return '>';
+    if (std.mem.eql(u8, entity, "nbsp")) return ' ';
+    if (entity.len > 2 and entity[0] == '#' and (entity[1] == 'x' or entity[1] == 'X')) {
+        return std.fmt.parseUnsigned(u21, entity[2..], 16) catch null;
+    }
+    if (entity.len > 1 and entity[0] == '#') {
+        return std.fmt.parseUnsigned(u21, entity[1..], 10) catch null;
+    }
+    return null;
+}
+
+fn decodeHtmlEntities(target: []u8, value: []const u8) []const u8 {
+    var input_index: usize = 0;
+    var output_index: usize = 0;
+    while (input_index < value.len and output_index < target.len) {
+        if (value[input_index] == '&') {
+            if (std.mem.indexOfScalar(u8, value[input_index..], ';')) |relative_end| {
+                if (relative_end <= 16) {
+                    const entity = value[input_index + 1 .. input_index + relative_end];
+                    if (htmlEntityCodepoint(entity)) |codepoint| {
+                        var encoded: [4]u8 = undefined;
+                        const encoded_length = std.unicode.utf8Encode(codepoint, &encoded) catch 0;
+                        if (encoded_length > 0 and output_index + encoded_length <= target.len) {
+                            @memcpy(target[output_index .. output_index + encoded_length], encoded[0..encoded_length]);
+                            output_index += encoded_length;
+                            input_index += relative_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        target[output_index] = value[input_index];
+        output_index += 1;
+        input_index += 1;
+    }
+    return target[0..output_index];
+}
+
+fn elementText(target: []u8, html: []const u8, tag_name: []const u8) ?[]const u8 {
+    var opening_buffer: [32]u8 = undefined;
+    const opening = std.fmt.bufPrint(&opening_buffer, "<{s}", .{tag_name}) catch return null;
+    const element_start = std.mem.indexOf(u8, html, opening) orelse return null;
+    const content_marker = std.mem.indexOfPos(u8, html, element_start, ">") orelse return null;
+    const content_start = content_marker + 1;
+    var closing_buffer: [32]u8 = undefined;
+    const closing = std.fmt.bufPrint(&closing_buffer, "</{s}>", .{tag_name}) catch return null;
+    const content_end = std.mem.indexOfPos(u8, html, content_start, closing) orelse return null;
+    const text = stripTags(target, html[content_start..content_end]);
+    return if (text.len > 0) text else null;
+}
+
 fn hasSeason(series: *const Series, number: u16) bool {
     for (series.seasons[0..series.season_count]) |season| {
         if (season.number == number) return true;
@@ -416,7 +473,9 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
             const value_start = title_open_end + 1;
             const title_end = std.mem.indexOfPos(u8, html, value_start, "</title>") orelse value_start;
             var title_buffer: [256]u8 = undefined;
-            series.title.set(stripTags(&title_buffer, html[value_start..title_end]));
+            var decoded_title_buffer: [256]u8 = undefined;
+            const raw_title = stripTags(&title_buffer, html[value_start..title_end]);
+            series.title.set(decodeHtmlEntities(&decoded_title_buffer, raw_title));
         }
     }
 
@@ -460,18 +519,25 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
     }
 
     if (location.kind == .threecat) {
-        var season_cursor: usize = 0;
-        const marker = "Temporada ";
-        while (std.mem.indexOfPos(u8, html, season_cursor, marker)) |season_start| {
-            const number_start = season_start + marker.len;
-            var number_end = number_start;
-            while (number_end < html.len and std.ascii.isDigit(html[number_end])) : (number_end += 1) {}
-            if (number_end > number_start) {
-                if (std.fmt.parseUnsigned(u16, html[number_start..number_end], 10)) |number| {
-                    addThreecatSeason(series, number, location.root_url.slice());
-                } else |_| {}
+        var dropdown_cursor: usize = 0;
+        const dropdown_marker = "data-testid=\"dropdown\"";
+        while (std.mem.indexOfPos(u8, html, dropdown_cursor, dropdown_marker)) |dropdown_start| {
+            const list_end = std.mem.indexOfPos(u8, html, dropdown_start, "</ul>") orelse break;
+            const dropdown = html[dropdown_start .. list_end + "</ul>".len];
+            var season_cursor: usize = 0;
+            const season_marker = "Temporada ";
+            while (std.mem.indexOfPos(u8, dropdown, season_cursor, season_marker)) |season_start| {
+                const number_start = season_start + season_marker.len;
+                var number_end = number_start;
+                while (number_end < dropdown.len and std.ascii.isDigit(dropdown[number_end])) : (number_end += 1) {}
+                if (number_end > number_start) {
+                    if (std.fmt.parseUnsigned(u16, dropdown[number_start..number_end], 10)) |number| {
+                        addThreecatSeason(series, number, location.root_url.slice());
+                    } else |_| {}
+                }
+                season_cursor = @max(number_end, number_start + 1);
             }
-            season_cursor = @max(number_end, number_start + 1);
+            dropdown_cursor = list_end + "</ul>".len;
         }
     }
 
@@ -535,12 +601,17 @@ pub fn parseSeasonPage(html: []const u8, season_index: usize, series: *Series) !
         }
 
         var title_buffer: [512]u8 = undefined;
+        var heading_buffer: [512]u8 = undefined;
         const anchor_body = html[anchor_open_end + 1 .. anchor_close];
         const title = findHtmlAttribute(tag, "title") orelse
             findHtmlAttribute(tag, "aria-label") orelse
+            elementText(&heading_buffer, anchor_body, "h2") orelse
+            elementText(&heading_buffer, anchor_body, "h3") orelse
             findHtmlAttribute(anchor_body, "alt") orelse
             stripTags(&title_buffer, anchor_body);
-        if (episodeSeasonFromTitle(title)) |detected_season| {
+        var decoded_title_buffer: [512]u8 = undefined;
+        const decoded_title = decodeHtmlEntities(&decoded_title_buffer, title);
+        if (episodeSeasonFromTitle(decoded_title)) |detected_season| {
             if (!season.is_virtual and detected_season != season.number) {
                 cursor = anchor_close + 4;
                 continue;
@@ -549,8 +620,8 @@ pub fn parseSeasonPage(html: []const u8, season_index: usize, series: *Series) !
         const item = &series.episodes[series.episode_count];
         item.* = .{ .season = season.number };
         item.id.set(id);
-        item.title.set(if (title.len > 0) title else id);
-        item.number = episodeNumberFromTitle(title, season.number);
+        item.title.set(if (decoded_title.len > 0) decoded_title else id);
+        item.number = episodeNumberFromTitle(decoded_title, season.number);
         resolvePageUrl(&item.url, season.url.slice(), href);
         series.episode_count += 1;
         season.episode_count += 1;
@@ -825,7 +896,7 @@ test "parse new 3cat series and nested episode title" {
     const index_html =
         \\<title data-next-head="">La Patrulla Peluda - 3Cat</title>
         \\<button aria-label="Obrir desplegable temporades">Temporada 3</button>
-        \\<ul><li>Temporada 3</li><li>Temporada 2</li><li>Temporada 1</li></ul>
+        \\<ul data-testid="dropdown"><li>Temporada 3</li><li>Temporada 2</li><li>Temporada 1</li></ul>
         \\<a href="/3cat/la-patrulla-peluda/capitols/temporada/3/">Tots</a>
     ;
     var series: Series = .{};
@@ -851,6 +922,7 @@ test "parse new 3cat program without seasons" {
     const index_html =
         \\<title>&quot;Lo Cartanyà&quot;, especial 20 anys - 3Cat</title>
         \\<a href="/3cat/lo-cartanya-especial-20-anys/capitols/">Capítols</a>
+        \\<script>{"info_distribucio":"Temporada 5 disponible"}</script>
     ;
     var series: Series = .{};
     try parseSeriesIndex(
@@ -861,16 +933,23 @@ test "parse new 3cat program without seasons" {
     try std.testing.expectEqual(@as(usize, 1), series.season_count);
     try std.testing.expect(series.seasons[0].is_virtual);
     try std.testing.expectEqualStrings(
+        "\"Lo Cartanyà\", especial 20 anys - 3Cat",
+        series.title.slice(),
+    );
+    try std.testing.expectEqualStrings(
         "https://www.3cat.cat/3cat/lo-cartanya-especial-20-anys/capitols/",
         series.seasons[0].url.slice(),
     );
 
     const chapters_html =
         \\<a href="/3cat/t1xc1-primer/video/6385177/"><img alt="T1xC1 - Primer"/></a>
-        \\<a href="/3cat/t2xc1-segon/video/6385178/"><img alt="T2xC1 - Segon"/></a>
+        \\<a href="/3cat/t2xc1-segon/video/6385178/"><img alt="T2xC1 - L&#x27;Albert"/></a>
+        \\<a href="/3cat/t1xc1-primer/video/6385177/"><h2>T1xC1 - Primer</h2><img alt="Icona rellotge"/></a>
     ;
     try parseSeasonPage(chapters_html, 0, &series);
     try std.testing.expectEqual(@as(usize, 2), series.episode_count);
+    try std.testing.expectEqualStrings("T1xC1 - Primer", series.episodes[0].title.slice());
+    try std.testing.expectEqualStrings("T2xC1 - L'Albert", series.episodes[1].title.slice());
 }
 
 test "parse catalog embedded in next data" {
