@@ -202,6 +202,62 @@ pub fn seriesOutputDirectory(
         std.fmt.bufPrint(buffer, "downloads/{s}/Temporada {d}", .{ title, season_number });
 }
 
+fn normalizedWebVttAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const timing_marker = std.mem.indexOf(u8, input, "-->") orelse return error.InvalidWebVtt;
+    const timing_line_start = if (std.mem.lastIndexOfScalar(u8, input[0..timing_marker], '\n')) |index|
+        index + 1
+    else
+        0;
+
+    var previous_end = timing_line_start;
+    while (previous_end > 0 and (input[previous_end - 1] == '\r' or input[previous_end - 1] == '\n')) {
+        previous_end -= 1;
+    }
+    const previous_start = if (previous_end > 0)
+        if (std.mem.lastIndexOfScalar(u8, input[0..previous_end], '\n')) |index| index + 1 else 0
+    else
+        timing_line_start;
+    const previous_line = std.mem.trim(u8, input[previous_start..previous_end], " \t\r\n");
+    const content_start = if (previous_line.len > 0) previous_start else timing_line_start;
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeAll("WEBVTT\n\n");
+    var cursor = content_start;
+    while (cursor < input.len) : (cursor += 1) {
+        if (input[cursor] == '\r') {
+            try output.writer.writeByte('\n');
+            if (cursor + 1 < input.len and input[cursor + 1] == '\n') cursor += 1;
+        } else {
+            try output.writer.writeByte(input[cursor]);
+        }
+    }
+    var list = output.toArrayList();
+    return try list.toOwnedSlice(allocator);
+}
+
+fn prepareSubtitleForMux(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    resource: *const core.Resource,
+    path: []const u8,
+) !void {
+    const original = try getAlloc(allocator, io, resource.url.slice());
+    defer allocator.free(original);
+    const normalized = if (std.mem.startsWith(u8, original, "WEBVTT"))
+        try normalizedWebVttAlloc(allocator, original)
+    else
+        try allocator.dupe(u8, original);
+    defer allocator.free(normalized);
+
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var write_buffer: [16 * 1024]u8 = undefined;
+    var file_writer = file.writerStreaming(io, &write_buffer);
+    try file_writer.interface.writeAll(normalized);
+    try file_writer.interface.flush();
+}
+
 test "series output directories separate seasons and unseasoned programs" {
     var buffer: [1024]u8 = undefined;
     const season = try seriesOutputDirectory("Sèrie: prova", 2, false, &buffer);
@@ -209,6 +265,24 @@ test "series output directories separate seasons and unseasoned programs" {
 
     const chapters = try seriesOutputDirectory("Programa", 1, true, &buffer);
     try std.testing.expectEqualStrings("downloads/Programa/Capítols", chapters);
+}
+
+test "normalize 3cat webvtt headers before muxing" {
+    const original =
+        "WEBVTT\r\n\r\n" ++
+        "Region: id=r1 width=100%\r\n\r\n\r\n" ++
+        "1\r\n" ++
+        "00:00:02.320 --> 00:00:05.160 region:r1 line:88% align:center\r\n" ++
+        "<c.white>Primer subtítol</c>\r\n\r\n";
+    const normalized = try normalizedWebVttAlloc(std.testing.allocator, original);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings(
+        "WEBVTT\n\n" ++
+            "1\n" ++
+            "00:00:02.320 --> 00:00:05.160 region:r1 line:88% align:center\n" ++
+            "<c.white>Primer subtítol</c>\n\n",
+        normalized,
+    );
 }
 
 fn urlExtension(url: []const u8, fallback: []const u8) []const u8 {
@@ -312,10 +386,17 @@ pub fn downloadSelectedResources(
     }
 }
 
-fn addArgument(arguments: *[256][]const u8, count: *usize, value: []const u8) !void {
+fn addArgument(arguments: *[512][]const u8, count: *usize, value: []const u8) !void {
     if (count.* >= arguments.len) return error.TooManyArguments;
     arguments[count.*] = value;
     count.* += 1;
+}
+
+fn mp4LanguageCode(language: []const u8) []const u8 {
+    if (std.mem.eql(u8, language, "ca")) return "cat";
+    if (std.mem.eql(u8, language, "es")) return "spa";
+    if (std.mem.eql(u8, language, "en")) return "eng";
+    return if (language.len == 3) language else "und";
 }
 
 pub fn muxSelected(
@@ -344,7 +425,32 @@ pub fn muxSelected(
     var temporary_path_buffer: [2056]u8 = undefined;
     const temporary_path = try std.fmt.bufPrint(&temporary_path_buffer, "{s}.part", .{final_path});
 
-    var arguments: [256][]const u8 = undefined;
+    var subtitle_path_buffers: [core.max_resources][2048]u8 = undefined;
+    var subtitle_paths: [core.max_resources][]const u8 = undefined;
+    var subtitle_resources: [core.max_resources]*const core.Resource = undefined;
+    var prepared_subtitle_count: usize = 0;
+    defer {
+        for (subtitle_paths[0..prepared_subtitle_count]) |path| {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        }
+    }
+    if (episode.include_subtitles_mux) {
+        for (episode.resources[0..episode.resource_count], 0..) |*resource, resource_index| {
+            if (resource.kind != .subtitle) continue;
+            const path = try std.fmt.bufPrint(
+                &subtitle_path_buffers[prepared_subtitle_count],
+                "{s}/.baixa3-subtitle-{d}.vtt",
+                .{ output_directory, resource_index },
+            );
+            try prepareSubtitleForMux(allocator, io, resource, path);
+            subtitle_paths[prepared_subtitle_count] = path;
+            subtitle_resources[prepared_subtitle_count] = resource;
+            prepared_subtitle_count += 1;
+        }
+    }
+    if (prepared_subtitle_count != subtitle_count) return error.SubtitlePreparationFailed;
+
+    var arguments: [512][]const u8 = undefined;
     var argument_count: usize = 0;
     try addArgument(&arguments, &argument_count, "ffmpeg");
     try addArgument(&arguments, &argument_count, "-hide_banner");
@@ -353,15 +459,15 @@ pub fn muxSelected(
     try addArgument(&arguments, &argument_count, "-y");
     try addArgument(&arguments, &argument_count, "-i");
     try addArgument(&arguments, &argument_count, episode.manifest_url.slice());
-    for (episode.resources[0..episode.resource_count]) |*resource| {
-        if (resource.kind == .subtitle and episode.include_subtitles_mux) {
-            try addArgument(&arguments, &argument_count, "-i");
-            try addArgument(&arguments, &argument_count, resource.url.slice());
-        }
+    for (subtitle_paths[0..prepared_subtitle_count]) |path| {
+        try addArgument(&arguments, &argument_count, "-i");
+        try addArgument(&arguments, &argument_count, path);
     }
 
-    var dynamic_arguments: [core.max_resources * 3][48]u8 = undefined;
+    var dynamic_arguments: [core.max_resources * 6][64]u8 = undefined;
     var dynamic_count: usize = 0;
+    var metadata_values: [core.max_resources * 2][256]u8 = undefined;
+    var metadata_value_count: usize = 0;
     try addArgument(&arguments, &argument_count, "-map");
     const video_map = try std.fmt.bufPrint(&dynamic_arguments[dynamic_count], "0:v:{d}", .{video.stream_index});
     dynamic_count += 1;
@@ -383,10 +489,54 @@ pub fn muxSelected(
     var subtitle_input_index: usize = 1;
     var selected_subtitle_index: usize = 0;
     while (selected_subtitle_index < subtitle_count) : (selected_subtitle_index += 1) {
+        const resource = subtitle_resources[selected_subtitle_index];
         try addArgument(&arguments, &argument_count, "-map");
         const subtitle_map = try std.fmt.bufPrint(&dynamic_arguments[dynamic_count], "{d}:s:0", .{subtitle_input_index});
         dynamic_count += 1;
         try addArgument(&arguments, &argument_count, subtitle_map);
+
+        const language_key = try std.fmt.bufPrint(
+            &dynamic_arguments[dynamic_count],
+            "-metadata:s:s:{d}",
+            .{selected_subtitle_index},
+        );
+        dynamic_count += 1;
+        const language_value = try std.fmt.bufPrint(
+            &metadata_values[metadata_value_count],
+            "language={s}",
+            .{mp4LanguageCode(resource.language.slice())},
+        );
+        metadata_value_count += 1;
+        try addArgument(&arguments, &argument_count, language_key);
+        try addArgument(&arguments, &argument_count, language_value);
+
+        const handler_key = try std.fmt.bufPrint(
+            &dynamic_arguments[dynamic_count],
+            "-metadata:s:s:{d}",
+            .{selected_subtitle_index},
+        );
+        dynamic_count += 1;
+        const handler_value = try std.fmt.bufPrint(
+            &metadata_values[metadata_value_count],
+            "handler_name={s}",
+            .{resource.label.slice()},
+        );
+        metadata_value_count += 1;
+        try addArgument(&arguments, &argument_count, handler_key);
+        try addArgument(&arguments, &argument_count, handler_value);
+
+        const disposition_key = try std.fmt.bufPrint(
+            &dynamic_arguments[dynamic_count],
+            "-disposition:s:{d}",
+            .{selected_subtitle_index},
+        );
+        dynamic_count += 1;
+        try addArgument(&arguments, &argument_count, disposition_key);
+        try addArgument(
+            &arguments,
+            &argument_count,
+            if (selected_subtitle_index == 0) "default" else "0",
+        );
         subtitle_input_index += 1;
     }
     try addArgument(&arguments, &argument_count, "-c:v");

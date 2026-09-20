@@ -180,4 +180,4 @@ Utilitza'l de manera responsable i respecta els drets, les condicions d'ús i le
 
 ---
 
-Versió actual: **0.2.0**
+Versió actual: **0.2.1**
