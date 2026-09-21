@@ -6,7 +6,7 @@ const c = @cImport({
     @cInclude("ui_bridge.h");
 });
 
-const app_version = "0.2.1";
+const app_version = "0.2.2";
 const app_display_name = "Baixa3 · v" ++ app_version;
 
 const JobKind = enum {
