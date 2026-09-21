@@ -92,7 +92,7 @@ fn startJob(kind: JobKind, url: []const u8) void {
 
 fn selectedSeriesEpisodeCount() usize {
     var count: usize = 0;
-    for (series.episodes[0..series.episode_count]) |item| {
+    for (series.episodes.items) |item| {
         if (item.selected) count += 1;
     }
     return count;
@@ -100,18 +100,18 @@ fn selectedSeriesEpisodeCount() usize {
 
 fn selectedEpisodeCount(first: usize, end: usize) usize {
     var count: usize = 0;
-    for (series.episodes[first..end]) |item| {
+    for (series.episodes.items[first..end]) |item| {
         if (item.selected) count += 1;
     }
     return count;
 }
 
 fn setEpisodeSelection(first: usize, end: usize, selected: bool) void {
-    for (series.episodes[first..end]) |*item| item.selected = selected;
+    for (series.episodes.items[first..end]) |*item| item.selected = selected;
 }
 
 fn batchOutputDirectory(item: *const core.EpisodeSummary, buffer: []u8) ![]const u8 {
-    for (series.seasons[0..series.season_count]) |season| {
+    for (series.seasons.items) |season| {
         if (season.number == item.season) {
             return net.seriesOutputDirectory(
                 series.title.slice(),
@@ -271,7 +271,7 @@ fn runSeriesIndividualDownload() void {
     var position: usize = 0;
     var completed: usize = 0;
     var failed: usize = 0;
-    for (series.episodes[0..series.episode_count]) |*item| {
+    for (series.episodes.items) |*item| {
         if (!item.selected) continue;
         position += 1;
         setBatchItemStatus("Descarregant", position, total, item.title.slice());
@@ -333,7 +333,7 @@ fn runSeriesMux() void {
     var position: usize = 0;
     var completed: usize = 0;
     var failed: usize = 0;
-    for (series.episodes[0..series.episode_count]) |*item| {
+    for (series.episodes.items) |*item| {
         if (!item.selected) continue;
         position += 1;
         setBatchItemStatus("Fent muxing", position, total, item.title.slice());
@@ -408,11 +408,11 @@ fn worker(job: *Job) void {
                     return;
                 };
                 series_profile.clear();
-                if (ffmpeg_detected and series.episode_count > 0) {
+                if (ffmpeg_detected and series.episodes.items.len > 0) {
                     net.fetchEpisode(
                         allocator,
                         app_io,
-                        series.episodes[0].id.slice(),
+                        series.episodes.items[0].id.slice(),
                         &series_profile,
                     ) catch {};
                 }
@@ -421,17 +421,25 @@ fn worker(job: *Job) void {
                 const message = std.fmt.bufPrint(
                     &message_buffer,
                     "Sèrie carregada: {d} temporades i {d} episodis.",
-                    .{ series.season_count, series.episode_count },
+                    .{ series.seasons.items.len, series.episodes.items.len },
                 ) catch "Sèrie carregada correctament.";
                 setStatus(message);
             }
         },
         .individual_download => {
+            var output_directory_buffer: [1024]u8 = undefined;
+            const output_directory = net.episodeOutputDirectory(
+                episode.program.slice(),
+                &output_directory_buffer,
+            ) catch |err| {
+                setErrorStatus(err);
+                return;
+            };
             net.downloadSelectedResources(
                 allocator,
                 app_io,
                 &episode,
-                "downloads",
+                output_directory,
                 .{ .current = &progress_current, .total = &progress_total },
             ) catch |err| {
                 setErrorStatus(err);
@@ -444,11 +452,19 @@ fn worker(job: *Job) void {
                 setStatus("FFmpeg no està disponible.");
                 return;
             }
+            var output_directory_buffer: [1024]u8 = undefined;
+            const output_directory = net.episodeOutputDirectory(
+                episode.program.slice(),
+                &output_directory_buffer,
+            ) catch |err| {
+                setErrorStatus(err);
+                return;
+            };
             net.muxSelected(
                 allocator,
                 app_io,
                 &episode,
-                "downloads",
+                output_directory,
                 .{ .current = &progress_current, .total = &progress_total },
             ) catch |err| {
                 setErrorStatus(err);
@@ -583,12 +599,12 @@ fn drawSeries() void {
 
     if (c.sx3_ui_panel_begin("episode_selection", 300.0)) {
         const total_selected = selectedSeriesEpisodeCount();
-        const all_selected = series.episode_count > 0 and total_selected == series.episode_count;
+        const all_selected = series.episodes.items.len > 0 and total_selected == series.episodes.items.len;
         var root_buffer: [128]u8 = undefined;
         const root_label = std.fmt.bufPrintZ(
             &root_buffer,
             "Tota la sèrie · {d}/{d} episodis###arrel_serie",
-            .{ total_selected, series.episode_count },
+            .{ total_selected, series.episodes.items.len },
         ) catch "Tota la sèrie";
         c.sx3_ui_push_id(-1);
         const root_selection = c.sx3_ui_checkbox_mixed(
@@ -599,11 +615,11 @@ fn drawSeries() void {
         c.sx3_ui_same_line();
         const root_open = c.sx3_ui_tree_begin(root_label.ptr, true);
         if (root_selection != all_selected) {
-            setEpisodeSelection(0, series.episode_count, root_selection);
+            setEpisodeSelection(0, series.episodes.items.len, root_selection);
         }
 
         if (root_open) {
-            for (series.seasons[0..series.season_count], 0..) |*season, season_index| {
+            for (series.seasons.items, 0..) |*season, season_index| {
                 const end = season.first_episode + season.episode_count;
                 const season_selected = selectedEpisodeCount(season.first_episode, end);
                 const season_all_selected = season.episode_count > 0 and season_selected == season.episode_count;
@@ -633,7 +649,7 @@ fn drawSeries() void {
                     setEpisodeSelection(season.first_episode, end, new_selection);
                 }
                 if (open) {
-                    for (series.episodes[season.first_episode..end], 0..) |*item, item_index| {
+                    for (series.episodes.items[season.first_episode..end], 0..) |*item, item_index| {
                         var episode_buffer: [320]u8 = undefined;
                         const episode_label = if (item.number > 0)
                             std.fmt.bufPrintZ(&episode_buffer, "Capítol {d} · {s}", .{ item.number, item.title.slice() }) catch "Episodi"

@@ -1,8 +1,6 @@
 const std = @import("std");
 
 pub const max_resources = 64;
-pub const max_seasons = 16;
-pub const max_episodes = 512;
 pub const max_catalog_items = 2048;
 
 pub fn FixedText(comptime capacity: usize) type {
@@ -70,6 +68,7 @@ pub const Resource = struct {
 pub const Episode = struct {
     id: FixedText(32) = .{},
     title: FixedText(256) = .{},
+    program: FixedText(256) = .{},
     manifest_url: FixedText(2048) = .{},
     resources: [max_resources]Resource = [_]Resource{.{}} ** max_resources,
     resource_count: usize = 0,
@@ -109,12 +108,18 @@ pub const Season = struct {
 
 pub const Series = struct {
     title: FixedText(256) = .{},
-    seasons: [max_seasons]Season = [_]Season{.{}} ** max_seasons,
-    season_count: usize = 0,
-    episodes: [max_episodes]EpisodeSummary = [_]EpisodeSummary{.{}} ** max_episodes,
-    episode_count: usize = 0,
+    seasons: std.ArrayList(Season) = .empty,
+    episodes: std.ArrayList(EpisodeSummary) = .empty,
 
     pub fn clear(self: *Series) void {
+        self.title = .{};
+        self.seasons.clearRetainingCapacity();
+        self.episodes.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *Series, allocator: std.mem.Allocator) void {
+        self.seasons.deinit(allocator);
+        self.episodes.deinit(allocator);
         self.* = .{};
     }
 };
@@ -440,29 +445,43 @@ fn elementText(target: []u8, html: []const u8, tag_name: []const u8) ?[]const u8
 }
 
 fn hasSeason(series: *const Series, number: u16) bool {
-    for (series.seasons[0..series.season_count]) |season| {
+    for (series.seasons.items) |season| {
         if (season.number == number) return true;
     }
     return false;
 }
 
-fn addLinkedSeason(series: *Series, number: u16, base_url: []const u8, href: []const u8) void {
-    if (hasSeason(series, number) or series.season_count >= series.seasons.len) return;
-    const season = &series.seasons[series.season_count];
-    season.* = .{ .number = number };
+fn addLinkedSeason(
+    allocator: std.mem.Allocator,
+    series: *Series,
+    number: u16,
+    base_url: []const u8,
+    href: []const u8,
+) !void {
+    if (hasSeason(series, number)) return;
+    var season: Season = .{ .number = number };
     resolvePageUrl(&season.url, base_url, href);
-    series.season_count += 1;
+    try series.seasons.append(allocator, season);
 }
 
-fn addThreecatSeason(series: *Series, number: u16, root_url: []const u8) void {
-    if (hasSeason(series, number) or series.season_count >= series.seasons.len) return;
-    const season = &series.seasons[series.season_count];
-    season.* = .{ .number = number };
+fn addThreecatSeason(
+    allocator: std.mem.Allocator,
+    series: *Series,
+    number: u16,
+    root_url: []const u8,
+) !void {
+    if (hasSeason(series, number)) return;
+    var season: Season = .{ .number = number };
     season.url.setFmt("{s}capitols/temporada/{d}/", .{ root_url, number });
-    series.season_count += 1;
+    try series.seasons.append(allocator, season);
 }
 
-pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series) !void {
+pub fn parseSeriesIndex(
+    allocator: std.mem.Allocator,
+    html: []const u8,
+    base_url: []const u8,
+    series: *Series,
+) !void {
     series.clear();
     var location: SeriesLocation = .{};
     try classifySeriesUrl(base_url, &location);
@@ -502,7 +521,7 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
             cursor = tag_end + 1;
             continue;
         };
-        addLinkedSeason(series, number, location.root_url.slice(), href);
+        try addLinkedSeason(allocator, series, number, location.root_url.slice(), href);
         cursor = tag_end + 1;
     }
 
@@ -512,7 +531,7 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
         const tag = html[option_start .. option_end + 1];
         if (findHtmlAttribute(tag, "value")) |href| {
             if (seasonNumberFromUrl(href)) |number| {
-                addLinkedSeason(series, number, location.root_url.slice(), href);
+                try addLinkedSeason(allocator, series, number, location.root_url.slice(), href);
             }
         }
         option_cursor = option_end + 1;
@@ -532,7 +551,7 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
                 while (number_end < dropdown.len and std.ascii.isDigit(dropdown[number_end])) : (number_end += 1) {}
                 if (number_end > number_start) {
                     if (std.fmt.parseUnsigned(u16, dropdown[number_start..number_end], 10)) |number| {
-                        addThreecatSeason(series, number, location.root_url.slice());
+                        try addThreecatSeason(allocator, series, number, location.root_url.slice());
                     } else |_| {}
                 }
                 season_cursor = @max(number_end, number_start + 1);
@@ -541,14 +560,14 @@ pub fn parseSeriesIndex(html: []const u8, base_url: []const u8, series: *Series)
         }
     }
 
-    if (series.season_count == 0 and unseasoned_chapters_url.len > 0) {
-        series.seasons[0] = .{ .number = 1, .is_virtual = true };
-        series.seasons[0].url.set(unseasoned_chapters_url.slice());
-        series.season_count = 1;
+    if (series.seasons.items.len == 0 and unseasoned_chapters_url.len > 0) {
+        var season: Season = .{ .number = 1, .is_virtual = true };
+        season.url.set(unseasoned_chapters_url.slice());
+        try series.seasons.append(allocator, season);
     }
 
-    if (series.season_count == 0) return error.NoSeasons;
-    std.mem.sort(Season, series.seasons[0..series.season_count], {}, struct {
+    if (series.seasons.items.len == 0) return error.NoSeasons;
+    std.mem.sort(Season, series.seasons.items, {}, struct {
         fn lessThan(_: void, left: Season, right: Season) bool {
             return left.number < right.number;
         }
@@ -574,10 +593,15 @@ fn episodeSeasonFromTitle(title: []const u8) ?u16 {
     return std.fmt.parseUnsigned(u16, tail[0..end], 10) catch null;
 }
 
-pub fn parseSeasonPage(html: []const u8, season_index: usize, series: *Series) !void {
-    if (season_index >= series.season_count) return error.InvalidSeason;
-    const season = &series.seasons[season_index];
-    season.first_episode = series.episode_count;
+pub fn parseSeasonPage(
+    allocator: std.mem.Allocator,
+    html: []const u8,
+    season_index: usize,
+    series: *Series,
+) !void {
+    if (season_index >= series.seasons.items.len) return error.InvalidSeason;
+    const season = &series.seasons.items[season_index];
+    season.first_episode = series.episodes.items.len;
     var cursor: usize = 0;
     while (std.mem.indexOfPos(u8, html, cursor, "<a")) |anchor_start| {
         const anchor_open_end = std.mem.indexOfPos(u8, html, anchor_start, ">") orelse break;
@@ -592,10 +616,10 @@ pub fn parseSeasonPage(html: []const u8, season_index: usize, series: *Series) !
             continue;
         };
         var duplicate = false;
-        for (series.episodes[0..series.episode_count]) |existing| {
+        for (series.episodes.items) |existing| {
             if (std.mem.eql(u8, existing.id.slice(), id)) duplicate = true;
         }
-        if (duplicate or series.episode_count >= series.episodes.len) {
+        if (duplicate) {
             cursor = anchor_close + 4;
             continue;
         }
@@ -617,20 +641,19 @@ pub fn parseSeasonPage(html: []const u8, season_index: usize, series: *Series) !
                 continue;
             }
         }
-        const item = &series.episodes[series.episode_count];
-        item.* = .{ .season = season.number };
+        var item: EpisodeSummary = .{ .season = season.number };
         item.id.set(id);
         item.title.set(if (decoded_title.len > 0) decoded_title else id);
         item.number = episodeNumberFromTitle(decoded_title, season.number);
         resolvePageUrl(&item.url, season.url.slice(), href);
-        series.episode_count += 1;
+        try series.episodes.append(allocator, item);
         season.episode_count += 1;
         cursor = anchor_close + 4;
     }
 
     const first = season.first_episode;
     const end = first + season.episode_count;
-    std.mem.sort(EpisodeSummary, series.episodes[first..end], {}, struct {
+    std.mem.sort(EpisodeSummary, series.episodes.items[first..end], {}, struct {
         fn lessThan(_: void, left: EpisodeSummary, right: EpisodeSummary) bool {
             if (left.number == 0 and right.number != 0) return false;
             if (left.number != 0 and right.number == 0) return true;
@@ -658,6 +681,16 @@ pub fn parseEpisodeJson(allocator: std.mem.Allocator, json: []const u8, episode:
                 else => {},
             };
             if (jsonString(information.get("titol"))) |title| episode.title.set(title);
+            if (jsonString(information.get("programa"))) |program| {
+                const permalink = jsonString(information.get("permalink")) orelse "";
+                if (std.mem.indexOf(u8, permalink, "/3cat/") != null) {
+                    episode.program.setFmt("{s} - 3Cat", .{program});
+                } else if (std.mem.indexOf(u8, permalink, "/tv3/sx3/") != null) {
+                    episode.program.setFmt("{s} - SX3", .{program});
+                } else {
+                    episode.program.set(program);
+                }
+            }
         }
     }
 
@@ -804,6 +837,20 @@ test "extract episode id" {
     try std.testing.expect(extractEpisodeId("https://www.3cat.cat/serie/") == null);
 }
 
+test "parse episode program metadata" {
+    const json =
+        \\{
+        \\  "informacio": {"id": 6077759, "titol": "Aitana", "programa": "Adolescents XL", "permalink": "https://www.3cat.cat/3cat/aitana/video/6077759/"},
+        \\  "media": {"url": []}
+        \\}
+    ;
+    var episode: Episode = .{};
+    try parseEpisodeJson(std.testing.allocator, json, &episode);
+    try std.testing.expectEqualStrings("6077759", episode.id.slice());
+    try std.testing.expectEqualStrings("Aitana", episode.title.slice());
+    try std.testing.expectEqualStrings("Adolescents XL - 3Cat", episode.program.slice());
+}
+
 test "normalize season url to series root" {
     var normalized: FixedText(2048) = .{};
     try normalizeSeriesUrl(
@@ -874,21 +921,22 @@ test "parse series seasons and episodes" {
         \\<option value="/tv3/sx3/la-patrulla-peluda/videos/temporada-1/">Temporada 1</option>
     ;
     var series: Series = .{};
-    try parseSeriesIndex(index_html, "https://www.3cat.cat/tv3/sx3/la-patrulla-peluda/", &series);
-    try std.testing.expectEqual(@as(usize, 2), series.season_count);
-    try std.testing.expectEqual(@as(u16, 1), series.seasons[0].number);
+    defer series.deinit(std.testing.allocator);
+    try parseSeriesIndex(std.testing.allocator, index_html, "https://www.3cat.cat/tv3/sx3/la-patrulla-peluda/", &series);
+    try std.testing.expectEqual(@as(usize, 2), series.seasons.items.len);
+    try std.testing.expectEqual(@as(u16, 1), series.seasons.items[0].number);
 
     const season_html =
         \\<a title="T1xC2 - Segon episodi" href="/tv3/sx3/segon/video/123/">Segon</a>
         \\<a title="T1xC1 - Primer episodi" href="/tv3/sx3/primer/video/122/">Primer</a>
         \\<a title="T2xC1 - Altra temporada" href="/tv3/sx3/altre/video/999/">Altre</a>
     ;
-    try parseSeasonPage(season_html, 0, &series);
-    try std.testing.expectEqual(@as(usize, 2), series.episode_count);
-    try std.testing.expectEqualStrings("122", series.episodes[0].id.slice());
+    try parseSeasonPage(std.testing.allocator, season_html, 0, &series);
+    try std.testing.expectEqual(@as(usize, 2), series.episodes.items.len);
+    try std.testing.expectEqualStrings("122", series.episodes.items[0].id.slice());
     try std.testing.expectEqualStrings(
         "https://www.3cat.cat/tv3/sx3/primer/video/122/",
-        series.episodes[0].url.slice(),
+        series.episodes.items[0].url.slice(),
     );
 }
 
@@ -900,11 +948,12 @@ test "parse new 3cat series and nested episode title" {
         \\<a href="/3cat/la-patrulla-peluda/capitols/temporada/3/">Tots</a>
     ;
     var series: Series = .{};
-    try parseSeriesIndex(index_html, "https://www.3cat.cat/3cat/la-patrulla-peluda/", &series);
-    try std.testing.expectEqual(@as(usize, 3), series.season_count);
+    defer series.deinit(std.testing.allocator);
+    try parseSeriesIndex(std.testing.allocator, index_html, "https://www.3cat.cat/3cat/la-patrulla-peluda/", &series);
+    try std.testing.expectEqual(@as(usize, 3), series.seasons.items.len);
     try std.testing.expectEqualStrings(
         "https://www.3cat.cat/3cat/la-patrulla-peluda/capitols/temporada/1/",
-        series.seasons[0].url.slice(),
+        series.seasons.items[0].url.slice(),
     );
 
     const season_html =
@@ -912,10 +961,10 @@ test "parse new 3cat series and nested episode title" {
         \\<a href="/3cat/t1xc1-primer/video/6314970/"><h2>T1xC1 - Primer episodi</h2></a>
         \\<a href="/3cat/t1xc2-segon/video/6314971/"><img alt="T1xC2 - Segon episodi"/></a>
     ;
-    try parseSeasonPage(season_html, 0, &series);
-    try std.testing.expectEqual(@as(usize, 2), series.episode_count);
-    try std.testing.expectEqualStrings("T1xC1 - Primer episodi", series.episodes[0].title.slice());
-    try std.testing.expectEqualStrings("6314970", series.episodes[0].id.slice());
+    try parseSeasonPage(std.testing.allocator, season_html, 0, &series);
+    try std.testing.expectEqual(@as(usize, 2), series.episodes.items.len);
+    try std.testing.expectEqualStrings("T1xC1 - Primer episodi", series.episodes.items[0].title.slice());
+    try std.testing.expectEqualStrings("6314970", series.episodes.items[0].id.slice());
 }
 
 test "parse new 3cat program without seasons" {
@@ -925,20 +974,22 @@ test "parse new 3cat program without seasons" {
         \\<script>{"info_distribucio":"Temporada 5 disponible"}</script>
     ;
     var series: Series = .{};
+    defer series.deinit(std.testing.allocator);
     try parseSeriesIndex(
+        std.testing.allocator,
         index_html,
         "https://www.3cat.cat/3cat/lo-cartanya-especial-20-anys/",
         &series,
     );
-    try std.testing.expectEqual(@as(usize, 1), series.season_count);
-    try std.testing.expect(series.seasons[0].is_virtual);
+    try std.testing.expectEqual(@as(usize, 1), series.seasons.items.len);
+    try std.testing.expect(series.seasons.items[0].is_virtual);
     try std.testing.expectEqualStrings(
         "\"Lo Cartanyà\", especial 20 anys - 3Cat",
         series.title.slice(),
     );
     try std.testing.expectEqualStrings(
         "https://www.3cat.cat/3cat/lo-cartanya-especial-20-anys/capitols/",
-        series.seasons[0].url.slice(),
+        series.seasons.items[0].url.slice(),
     );
 
     const chapters_html =
@@ -946,10 +997,39 @@ test "parse new 3cat program without seasons" {
         \\<a href="/3cat/t2xc1-segon/video/6385178/"><img alt="T2xC1 - L&#x27;Albert"/></a>
         \\<a href="/3cat/t1xc1-primer/video/6385177/"><h2>T1xC1 - Primer</h2><img alt="Icona rellotge"/></a>
     ;
-    try parseSeasonPage(chapters_html, 0, &series);
-    try std.testing.expectEqual(@as(usize, 2), series.episode_count);
-    try std.testing.expectEqualStrings("T1xC1 - Primer", series.episodes[0].title.slice());
-    try std.testing.expectEqualStrings("T2xC1 - L'Albert", series.episodes[1].title.slice());
+    try parseSeasonPage(std.testing.allocator, chapters_html, 0, &series);
+    try std.testing.expectEqual(@as(usize, 2), series.episodes.items.len);
+    try std.testing.expectEqualStrings("T1xC1 - Primer", series.episodes.items[0].title.slice());
+    try std.testing.expectEqualStrings("T2xC1 - L'Albert", series.episodes.items[1].title.slice());
+}
+
+test "series grows beyond the previous season and episode limits" {
+    var index_html: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer index_html.deinit();
+    try index_html.writer.writeAll("<title>Sèrie llarga</title><ul data-testid=\"dropdown\">");
+    for (1..21) |number| try index_html.writer.print("<li>Temporada {d}</li>", .{number});
+    try index_html.writer.writeAll("</ul>");
+
+    var series: Series = .{};
+    defer series.deinit(std.testing.allocator);
+    try parseSeriesIndex(
+        std.testing.allocator,
+        index_html.written(),
+        "https://www.3cat.cat/3cat/serie-llarga/",
+        &series,
+    );
+    try std.testing.expectEqual(@as(usize, 20), series.seasons.items.len);
+
+    var season_html: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer season_html.deinit();
+    for (1..601) |number| {
+        try season_html.writer.print(
+            "<a title=\"T1xC{d} - Episodi {d}\" href=\"/3cat/episodi-{d}/video/{d}/\">Episodi</a>",
+            .{ number, number, number, 6_000_000 + number },
+        );
+    }
+    try parseSeasonPage(std.testing.allocator, season_html.written(), 0, &series);
+    try std.testing.expectEqual(@as(usize, 600), series.episodes.items.len);
 }
 
 test "parse catalog embedded in next data" {

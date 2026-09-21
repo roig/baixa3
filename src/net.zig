@@ -3,6 +3,8 @@ const core = @import("core.zig");
 
 pub const user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0";
 
+const progress_units_per_step: u64 = 1000;
+
 pub const Progress = struct {
     current: *std.atomic.Value(u64),
     total: *std.atomic.Value(u64),
@@ -12,25 +14,50 @@ pub const Progress = struct {
     operation_total: ?*std.atomic.Value(u64) = null,
 
     fn reset(self: Progress, total: u64) void {
+        const scaled_total = @max(total, 1) *| progress_units_per_step;
         if (self.range_size > 0 and self.operation_current != null and self.operation_total != null) {
             self.operation_current.?.store(0, .release);
-            self.operation_total.?.store(@max(total, 1), .release);
+            self.operation_total.?.store(scaled_total, .release);
             self.current.store(self.range_start, .release);
             return;
         }
         self.current.store(0, .release);
-        self.total.store(@max(total, 1), .release);
+        self.total.store(scaled_total, .release);
     }
 
-    fn advance(self: Progress) void {
+    fn publish(self: Progress, value: u64) void {
         if (self.range_size > 0 and self.operation_current != null and self.operation_total != null) {
-            const completed = self.operation_current.?.fetchAdd(1, .acq_rel) + 1;
             const operation_total = @max(self.operation_total.?.load(.acquire), 1);
-            const scaled = @min(self.range_size, completed * self.range_size / operation_total);
+            const completed = @min(value, operation_total);
+            self.operation_current.?.store(completed, .release);
+            const scaled = @min(self.range_size, (completed *| self.range_size) / operation_total);
             self.current.store(self.range_start + scaled, .release);
             return;
         }
-        _ = self.current.fetchAdd(1, .acq_rel);
+        self.current.store(@min(value, self.total.load(.acquire)), .release);
+    }
+
+    fn setStepBytes(self: Progress, step: u64, received: u64, expected: ?u64) void {
+        const total_bytes = expected orelse return;
+        if (total_bytes == 0) return;
+        const fraction = @min(
+            progress_units_per_step,
+            (received *| progress_units_per_step) / total_bytes,
+        );
+        self.publish(step *| progress_units_per_step +| fraction);
+    }
+
+    fn completeStep(self: Progress, step: u64) void {
+        self.publish((step +| 1) *| progress_units_per_step);
+    }
+
+    fn advance(self: Progress) void {
+        const current_value = if (self.range_size > 0 and self.operation_current != null)
+            self.operation_current.?.load(.acquire)
+        else
+            self.current.load(.acquire);
+        const next_step = current_value / progress_units_per_step;
+        self.completeStep(next_step);
     }
 };
 
@@ -78,6 +105,20 @@ test "single-step mux progress completes one batch episode" {
     progress.advance();
     try std.testing.expectEqual(@as(u64, 2000), current.load(.acquire));
     try std.testing.expectEqual(@as(u64, 3000), total.load(.acquire));
+}
+
+test "progress advances within a downloaded file" {
+    var current = std.atomic.Value(u64).init(0);
+    var total = std.atomic.Value(u64).init(1);
+    const progress: Progress = .{ .current = &current, .total = &total };
+
+    progress.reset(2);
+    progress.setStepBytes(0, 25, 100);
+    try std.testing.expectEqual(@as(u64, 250), current.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2000), total.load(.acquire));
+    progress.completeStep(0);
+    progress.setStepBytes(1, 50, 100);
+    try std.testing.expectEqual(@as(u64, 1500), current.load(.acquire));
 }
 
 pub fn getAlloc(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
@@ -130,15 +171,15 @@ pub fn fetchSeries(
     try core.normalizeSeriesUrl(series_url, &normalized_url);
     const index_html = try getAlloc(allocator, io, normalized_url.slice());
     defer allocator.free(index_html);
-    try core.parseSeriesIndex(index_html, normalized_url.slice(), series);
+    try core.parseSeriesIndex(allocator, index_html, normalized_url.slice(), series);
 
     var season_index: usize = 0;
-    while (season_index < series.season_count) : (season_index += 1) {
-        const season_html = try getAlloc(allocator, io, series.seasons[season_index].url.slice());
+    while (season_index < series.seasons.items.len) : (season_index += 1) {
+        const season_html = try getAlloc(allocator, io, series.seasons.items[season_index].url.slice());
         defer allocator.free(season_html);
-        try core.parseSeasonPage(season_html, season_index, series);
+        try core.parseSeasonPage(allocator, season_html, season_index, series);
     }
-    if (series.episode_count == 0) return error.NoEpisodes;
+    if (series.episodes.items.len == 0) return error.NoEpisodes;
 }
 
 pub fn fetchCatalog(
@@ -165,13 +206,42 @@ pub fn ffmpegAvailable(allocator: std.mem.Allocator, io: std.Io) bool {
     };
 }
 
-fn fetchToWriter(client: *std.http.Client, url: []const u8, writer: *std.Io.Writer) !void {
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = writer,
-        .headers = .{ .user_agent = .{ .override = user_agent } },
+fn fetchToWriter(
+    client: *std.http.Client,
+    url: []const u8,
+    writer: *std.Io.Writer,
+    progress: Progress,
+    step: u64,
+) !void {
+    const uri = try std.Uri.parse(url);
+    var request = try client.request(.GET, uri, .{
+        .headers = .{
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
     });
-    if (result.status.class() != .success) return error.HttpStatus;
+    defer request.deinit();
+    try request.sendBodiless();
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try request.receiveHead(&redirect_buffer);
+    if (response.head.status.class() != .success) return error.HttpStatus;
+
+    const expected = response.head.content_length;
+    var transfer_buffer: [64]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var received: u64 = 0;
+    while (true) {
+        const count = reader.readSliceShort(&read_buffer) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        };
+        if (count == 0) break;
+        try writer.writeAll(read_buffer[0..count]);
+        received +|= @intCast(count);
+        progress.setStepBytes(step, received, expected);
+    }
+    progress.completeStep(step);
 }
 
 fn sanitize(target: []u8, value: []const u8) []const u8 {
@@ -200,6 +270,12 @@ pub fn seriesOutputDirectory(
         std.fmt.bufPrint(buffer, "downloads/{s}/Capítols", .{title})
     else
         std.fmt.bufPrint(buffer, "downloads/{s}/Temporada {d}", .{ title, season_number });
+}
+
+pub fn episodeOutputDirectory(program_title: []const u8, buffer: []u8) ![]const u8 {
+    const title = std.mem.trim(u8, program_title, " \t\r\n");
+    if (title.len == 0) return std.fmt.bufPrint(buffer, "downloads", .{});
+    return seriesOutputDirectory(title, 1, true, buffer);
 }
 
 fn normalizedWebVttAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -265,6 +341,12 @@ test "series output directories separate seasons and unseasoned programs" {
 
     const chapters = try seriesOutputDirectory("Programa", 1, true, &buffer);
     try std.testing.expectEqualStrings("downloads/Programa/Capítols", chapters);
+
+    const episode_directory = try episodeOutputDirectory("Adolescents XL - 3Cat", &buffer);
+    try std.testing.expectEqualStrings("downloads/Adolescents XL - 3Cat/Capítols", episode_directory);
+
+    const unknown_program = try episodeOutputDirectory("", &buffer);
+    try std.testing.expectEqualStrings("downloads", unknown_program);
 }
 
 test "normalize 3cat webvtt headers before muxing" {
@@ -328,6 +410,7 @@ fn downloadResource(
     episode: *const core.Episode,
     output_directory: []const u8,
     progress: Progress,
+    completed_steps: *u64,
 ) !void {
     var final_path_buffer: [2048]u8 = undefined;
     const final_path = try resourcePath(resource, episode, output_directory, &final_path_buffer);
@@ -342,19 +425,25 @@ fn downloadResource(
         var write_buffer: [64 * 1024]u8 = undefined;
         var file_writer = file.writerStreaming(io, &write_buffer);
         if (resource.isDash()) {
-            try fetchToWriter(client, resource.initialization_url.slice(), &file_writer.interface);
-            progress.advance();
+            try fetchToWriter(
+                client,
+                resource.initialization_url.slice(),
+                &file_writer.interface,
+                progress,
+                completed_steps.*,
+            );
+            completed_steps.* += 1;
             var number = resource.segment_start;
             const end = resource.segment_start + resource.segment_count;
             while (number < end) : (number += 1) {
                 var segment_url_buffer: [2048]u8 = undefined;
                 const url = try segmentUrl(resource.segment_url_template.slice(), number, &segment_url_buffer);
-                try fetchToWriter(client, url, &file_writer.interface);
-                progress.advance();
+                try fetchToWriter(client, url, &file_writer.interface, progress, completed_steps.*);
+                completed_steps.* += 1;
             }
         } else {
-            try fetchToWriter(client, resource.url.slice(), &file_writer.interface);
-            progress.advance();
+            try fetchToWriter(client, resource.url.slice(), &file_writer.interface, progress, completed_steps.*);
+            completed_steps.* += 1;
         }
         try file_writer.interface.flush();
     }
@@ -379,9 +468,10 @@ pub fn downloadSelectedResources(
 
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
+    var completed_steps: u64 = 0;
     for (episode.resources[0..episode.resource_count]) |*resource| {
         if (resource.selected_individual) {
-            try downloadResource(&client, io, resource, episode, output_directory, progress);
+            try downloadResource(&client, io, resource, episode, output_directory, progress, &completed_steps);
         }
     }
 }
@@ -415,7 +505,7 @@ pub fn muxSelected(
         if (resource.kind == .subtitle and episode.include_subtitles_mux) subtitle_count += 1;
     }
     const video = selected_video orelse return error.NoVideoSelected;
-    progress.reset(1);
+    progress.reset(2);
     try std.Io.Dir.cwd().createDirPath(io, output_directory);
 
     var title_buffer: [280]u8 = undefined;
@@ -555,6 +645,8 @@ pub fn muxSelected(
     try addArgument(&arguments, &argument_count, "mp4");
     try addArgument(&arguments, &argument_count, temporary_path);
 
+    // La primera meitat indica que FFmpeg ja ha començat la fase de muxing.
+    progress.advance();
     const result = try std.process.run(allocator, io, .{
         .argv = arguments[0..argument_count],
         .stdout_limit = .limited(1024 * 1024),
