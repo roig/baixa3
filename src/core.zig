@@ -106,6 +106,11 @@ pub const Season = struct {
     is_virtual: bool = false,
 };
 
+pub const SeasonPagination = struct {
+    url: FixedText(4096) = .{},
+    total_pages: u32 = 0,
+};
+
 pub const Series = struct {
     title: FixedText(256) = .{},
     seasons: std.ArrayList(Season) = .empty,
@@ -202,6 +207,65 @@ fn jsonString(value: ?std.json.Value) ?[]const u8 {
         .string => |string| string,
         else => null,
     };
+}
+
+fn jsonUnsigned(value: ?std.json.Value) ?u64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        .string => |text| std.fmt.parseUnsigned(u64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn findSeasonPagination(value: std.json.Value, pagination: *SeasonPagination) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("paginacio")) |pagination_value| {
+                if (pagination_value == .object) {
+                    const total_pages = jsonUnsigned(pagination_value.object.get("total_pagines")) orelse 0;
+                    const url = jsonString(object.get("url")) orelse "";
+                    if (total_pages > 0 and std.mem.indexOf(u8, url, "/videos?") != null) {
+                        const placeholder = "%%dataResources.apiCCMA%%";
+                        if (std.mem.startsWith(u8, url, placeholder)) {
+                            pagination.url.setFmt("https://api.3cat.cat{s}", .{url[placeholder.len..]});
+                        } else {
+                            pagination.url.set(url);
+                        }
+                        pagination.total_pages = @intCast(total_pages);
+                        return true;
+                    }
+                }
+            }
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                if (findSeasonPagination(entry.value_ptr.*, pagination)) return true;
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (findSeasonPagination(item, pagination)) return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+pub fn parseSeasonPagination(
+    allocator: std.mem.Allocator,
+    html: []const u8,
+    pagination: *SeasonPagination,
+) !bool {
+    pagination.* = .{};
+    const id_position = std.mem.indexOf(u8, html, "id=\"__NEXT_DATA__\"") orelse return false;
+    const script_start = std.mem.lastIndexOf(u8, html[0..id_position], "<script") orelse return false;
+    const json_start_marker = std.mem.indexOfPos(u8, html, script_start, ">") orelse return false;
+    const json_start = json_start_marker + 1;
+    const json_end = std.mem.indexOfPos(u8, html, json_start, "</script>") orelse return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, html[json_start..json_end], .{});
+    defer parsed.deinit();
+    return findSeasonPagination(parsed.value, pagination);
 }
 
 fn catalogContains(catalog: *const Catalog, slug: []const u8) bool {
@@ -593,6 +657,19 @@ fn episodeSeasonFromTitle(title: []const u8) ?u16 {
     return std.fmt.parseUnsigned(u16, tail[0..end], 10) catch null;
 }
 
+fn sortSeasonEpisodes(series: *Series, season: *const Season) void {
+    const first = season.first_episode;
+    const end = first + season.episode_count;
+    std.mem.sort(EpisodeSummary, series.episodes.items[first..end], {}, struct {
+        fn lessThan(_: void, left: EpisodeSummary, right: EpisodeSummary) bool {
+            if (left.number == 0 and right.number != 0) return false;
+            if (left.number != 0 and right.number == 0) return true;
+            if (left.number != right.number) return left.number < right.number;
+            return std.mem.lessThan(u8, left.title.slice(), right.title.slice());
+        }
+    }.lessThan);
+}
+
 pub fn parseSeasonPage(
     allocator: std.mem.Allocator,
     html: []const u8,
@@ -651,16 +728,68 @@ pub fn parseSeasonPage(
         cursor = anchor_close + 4;
     }
 
-    const first = season.first_episode;
-    const end = first + season.episode_count;
-    std.mem.sort(EpisodeSummary, series.episodes.items[first..end], {}, struct {
-        fn lessThan(_: void, left: EpisodeSummary, right: EpisodeSummary) bool {
-            if (left.number == 0 and right.number != 0) return false;
-            if (left.number != 0 and right.number == 0) return true;
-            if (left.number != right.number) return left.number < right.number;
-            return std.mem.lessThan(u8, left.title.slice(), right.title.slice());
+    sortSeasonEpisodes(series, season);
+}
+
+pub fn parseSeasonApiPage(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    season_index: usize,
+    series: *Series,
+) !void {
+    if (season_index >= series.seasons.items.len) return error.InvalidSeason;
+    const season = &series.seasons.items[season_index];
+    if (season.episode_count == 0) season.first_episode = series.episodes.items.len;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidApiResponse;
+    const response_value = parsed.value.object.get("resposta") orelse return error.InvalidApiResponse;
+    if (response_value != .object) return error.InvalidApiResponse;
+    const items_value = response_value.object.get("items") orelse return error.InvalidApiResponse;
+    if (items_value != .object) return error.InvalidApiResponse;
+    const item_value = items_value.object.get("item") orelse return error.InvalidApiResponse;
+    if (item_value != .array) return error.InvalidApiResponse;
+
+    for (item_value.array.items) |value| {
+        if (value != .object) continue;
+        const object = value.object;
+        const id_number = jsonUnsigned(object.get("id")) orelse continue;
+        const slug = jsonString(object.get("nom_friendly")) orelse continue;
+        if (slug.len == 0) continue;
+
+        var id: FixedText(32) = .{};
+        id.setFmt("{d}", .{id_number});
+        var duplicate = false;
+        for (series.episodes.items) |existing| {
+            if (std.mem.eql(u8, existing.id.slice(), id.slice())) {
+                duplicate = true;
+                break;
+            }
         }
-    }.lessThan);
+        if (duplicate) continue;
+
+        const code = jsonString(object.get("titol")) orelse "";
+        const descriptive_title = jsonString(object.get("permatitle")) orelse "";
+        var item: EpisodeSummary = .{ .season = season.number };
+        item.id = id;
+        if (code.len > 0 and descriptive_title.len > 0 and !std.mem.eql(u8, code, descriptive_title)) {
+            item.title.setFmt("{s} - {s}", .{ code, descriptive_title });
+        } else if (descriptive_title.len > 0) {
+            item.title.set(descriptive_title);
+        } else if (code.len > 0) {
+            item.title.set(code);
+        } else {
+            item.title.set(id.slice());
+        }
+        const episode_number = jsonUnsigned(object.get("capitol_temporada")) orelse
+            jsonUnsigned(object.get("capitol")) orelse 0;
+        item.number = @intCast(@min(episode_number, std.math.maxInt(u16)));
+        item.url.setFmt("https://www.3cat.cat/3cat/{s}/video/{s}/", .{ slug, id.slice() });
+        try series.episodes.append(allocator, item);
+        season.episode_count += 1;
+    }
+    sortSeasonEpisodes(series, season);
 }
 
 pub fn parseEpisodeJson(allocator: std.mem.Allocator, json: []const u8, episode: *Episode) !void {
@@ -1030,6 +1159,38 @@ test "series grows beyond the previous season and episode limits" {
     }
     try parseSeasonPage(std.testing.allocator, season_html.written(), 0, &series);
     try std.testing.expectEqual(@as(usize, 600), series.episodes.items.len);
+}
+
+test "parse paginated season metadata and API episodes" {
+    const html =
+        \\<script id="__NEXT_DATA__" type="application/json">
+        \\{"props":{"module":{"paginacio":{"total_items":44,"items_pagina":18,"pagina_actual":1,"total_pagines":3},"url":"%%dataResources.apiCCMA%%/videos?_format=json&items_pagina=18&pagina=1&temporada=PUTEMP_1"}}}
+        \\</script>
+    ;
+    var pagination: SeasonPagination = .{};
+    try std.testing.expect(try parseSeasonPagination(std.testing.allocator, html, &pagination));
+    try std.testing.expectEqual(@as(u32, 3), pagination.total_pages);
+    try std.testing.expectEqualStrings(
+        "https://api.3cat.cat/videos?_format=json&items_pagina=18&pagina=1&temporada=PUTEMP_1",
+        pagination.url.slice(),
+    );
+
+    const page_json =
+        \\{"resposta":{"items":{"num":2,"item":[
+        \\{"id":181390691,"titol":"T1xC19","permatitle":"Teresa i Julià","nom_friendly":"teresa-i-julia-cap-19","capitol_temporada":19},
+        \\{"id":425,"titol":"T1xC20","permatitle":"L'Alfons torna","nom_friendly":"alfons-torna-cap-20","capitol_temporada":20}
+        \\]},"paginacio":{"total_pagines":3}}}
+    ;
+    var series: Series = .{};
+    defer series.deinit(std.testing.allocator);
+    try series.seasons.append(std.testing.allocator, .{ .number = 1 });
+    try parseSeasonApiPage(std.testing.allocator, page_json, 0, &series);
+    try std.testing.expectEqual(@as(usize, 2), series.episodes.items.len);
+    try std.testing.expectEqualStrings("T1xC19 - Teresa i Julià", series.episodes.items[0].title.slice());
+    try std.testing.expectEqualStrings(
+        "https://www.3cat.cat/3cat/alfons-torna-cap-20/video/425/",
+        series.episodes.items[1].url.slice(),
+    );
 }
 
 test "parse catalog embedded in next data" {

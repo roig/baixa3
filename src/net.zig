@@ -121,6 +121,19 @@ test "progress advances within a downloaded file" {
     try std.testing.expectEqual(@as(u64, 1500), current.load(.acquire));
 }
 
+test "pagination URL changes only the requested page" {
+    var buffer: [256]u8 = undefined;
+    const url = try paginationPageUrl(
+        "https://api.3cat.cat/videos?items_pagina=18&pagina=1&temporada=PUTEMP_1",
+        3,
+        &buffer,
+    );
+    try std.testing.expectEqualStrings(
+        "https://api.3cat.cat/videos?items_pagina=18&pagina=3&temporada=PUTEMP_1",
+        url,
+    );
+}
+
 pub fn getAlloc(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
@@ -161,6 +174,20 @@ pub fn fetchEpisode(
     }
 }
 
+fn paginationPageUrl(template: []const u8, page: u32, buffer: []u8) ![]const u8 {
+    const marker = "&pagina=";
+    const marker_start = std.mem.indexOf(u8, template, marker) orelse return error.InvalidPaginationUrl;
+    const number_start = marker_start + marker.len;
+    var number_end = number_start;
+    while (number_end < template.len and std.ascii.isDigit(template[number_end])) : (number_end += 1) {}
+    if (number_end == number_start) return error.InvalidPaginationUrl;
+    return std.fmt.bufPrint(
+        buffer,
+        "{s}{d}{s}",
+        .{ template[0..number_start], page, template[number_end..] },
+    );
+}
+
 pub fn fetchSeries(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -178,6 +205,21 @@ pub fn fetchSeries(
         const season_html = try getAlloc(allocator, io, series.seasons.items[season_index].url.slice());
         defer allocator.free(season_html);
         try core.parseSeasonPage(allocator, season_html, season_index, series);
+
+        var pagination: core.SeasonPagination = .{};
+        if (try core.parseSeasonPagination(allocator, season_html, &pagination)) {
+            var page: u32 = if (series.seasons.items[season_index].episode_count == 0) 1 else 2;
+            while (page <= pagination.total_pages) : (page += 1) {
+                var page_url_buffer: [4096]u8 = undefined;
+                const page_url = try paginationPageUrl(pagination.url.slice(), page, &page_url_buffer);
+                const page_json = try getAlloc(allocator, io, page_url);
+                core.parseSeasonApiPage(allocator, page_json, season_index, series) catch |err| {
+                    allocator.free(page_json);
+                    return err;
+                };
+                allocator.free(page_json);
+            }
+        }
     }
     if (series.episodes.items.len == 0) return error.NoEpisodes;
 }
