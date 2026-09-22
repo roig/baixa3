@@ -425,13 +425,16 @@ fn resourcePath(
     var title_buffer: [280]u8 = undefined;
     var label_buffer: [180]u8 = undefined;
     const title = sanitize(&title_buffer, episode.title.slice());
-    const label = sanitize(&label_buffer, resource.label.slice());
     const extension = switch (resource.kind) {
         .direct_video => urlExtension(resource.url.slice(), ".mp4"),
         .dash_video => ".mp4",
         .dash_audio => ".m4a",
         .subtitle => urlExtension(resource.url.slice(), ".vtt"),
     };
+    if (resource.kind == .direct_video) {
+        return std.fmt.bufPrint(buffer, "{s}/{s}{s}", .{ output_directory, title, extension });
+    }
+    const label = sanitize(&label_buffer, resource.label.slice());
     return std.fmt.bufPrint(buffer, "{s}/{s} - {s}{s}", .{ output_directory, title, label, extension });
 }
 
